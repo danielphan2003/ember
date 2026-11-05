@@ -7,6 +7,7 @@ if command -v cargo >/dev/null 2>&1; then exec cargo "$@"; fi
 engine=$(command -v podman || command -v docker) || { echo "need cargo, podman or docker" >&2; exit 1; }
 root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 tty=""; [ -t 0 ] && tty="-t"
+# shellcheck disable=SC2016 # the sh -c script expands inside the container
 exec "$engine" run --rm $tty -v "$root":/src:Z -w /src \
     -v ember-cargo-registry:/usr/local/cargo/registry:z -v ember-rustup:/usr/local/rustup:z \
     -e CARGO_TARGET_DIR=/src/target -e EMBER_AGENT="${EMBER_AGENT:-}" \

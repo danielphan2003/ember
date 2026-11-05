@@ -1,0 +1,47 @@
+# Runs the same checks as `just check` and `just build`, in the image
+# scripts/cargo uses locally. The e2e tests need /dev/kvm and root network
+# setup, so they run only on a real host (`just e2e`).
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    container: docker.io/library/rust:1-alpine
+    steps:
+      - run: apk add --no-cache git just musl-dev && rustup component add rustfmt clippy
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: just check
+
+  build:
+    runs-on: ubuntu-latest
+    container: docker.io/library/rust:1-alpine
+    steps:
+      - run: apk add --no-cache git just musl-dev
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: just build
+      - name: binaries are static
+        run: |
+          for b in dist/ember target/x86_64-unknown-linux-musl/release/ember-agent; do
+            ! ldd "$b" 2>&1 | grep -q '=>' || { echo "$b is dynamic"; exit 1; }
+          done
+          dist/ember --version
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: shellcheck scripts/cargo deploy/*.sh
