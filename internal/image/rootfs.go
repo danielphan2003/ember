@@ -34,7 +34,7 @@ type fixup struct {
 //
 // Every write goes through os.Root, so a hostile image cannot use symlinks
 // to write outside dir.
-func extract(r io.Reader, dir string) (fixups []fixup, size int64, err error) {
+func extract(r io.Reader, dir string, limit int64) (fixups []fixup, size int64, err error) {
 	root, err := os.OpenRoot(dir)
 	if err != nil {
 		return nil, 0, err
@@ -77,8 +77,11 @@ func extract(r io.Reader, dir string) (fixups []fixup, size int64, err error) {
 			if err != nil {
 				return nil, 0, err
 			}
-			n, err := io.Copy(f, tr)
+			n, err := io.Copy(f, io.LimitReader(tr, max(limit-size, 0)+1))
 			size += n
+			if err == nil && size > limit {
+				err = fmt.Errorf("image is larger than the %d MiB limit (max_image_mib)", limit>>20)
+			}
 			if cerr := f.Close(); err == nil {
 				err = cerr
 			}

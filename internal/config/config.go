@@ -39,6 +39,9 @@ type Config struct {
 	// ImageRefresh is how long a tag's digest is trusted before ember asks
 	// the registry again.
 	ImageRefresh time.Duration `yaml:"image_refresh"`
+	// MaxImageMiB caps an image's unpacked size, so a job naming a huge or
+	// hostile image cannot fill the disk.
+	MaxImageMiB int `yaml:"max_image_mib"`
 	// ImageKeep removes cached images unused for this long.
 	ImageKeep time.Duration `yaml:"image_keep"`
 	// Defaults are the VM size when the runner's plugin options set none.
@@ -48,6 +51,11 @@ type Config struct {
 	// HostReserveMiB is memory kept free for the host: a VM waits to start
 	// until MemAvailable covers its memory plus this reserve.
 	HostReserveMiB int `yaml:"host_reserve_mib"`
+	// MemoryBudgetMiB caps the memory promised to all VMs together.
+	// 0 means MemTotal minus host_reserve_mib.
+	MemoryBudgetMiB int `yaml:"memory_budget_mib"`
+	// MinFreeGiB: a VM does not start while state_dir has less free space.
+	MinFreeGiB int `yaml:"min_free_gib"`
 }
 
 func Default() Config {
@@ -61,14 +69,16 @@ func Default() Config {
 		TapPrefix:    "ember",
 		Subnet:       "172.30.0.0/16",
 		DNS:          []string{"1.1.1.1", "9.9.9.9"},
-		DefaultImage: "docker.io/library/node:24-bookworm",
+		DefaultImage: "docker.io/library/node:24-trixie",
 		ImageRefresh: time.Hour,
 		ImageKeep:    7 * 24 * time.Hour,
+		MaxImageMiB:  16 << 10,
 		VCPUs:        2,
 		MemoryMiB:    2048,
 		DiskGiB:      16,
 
 		HostReserveMiB: 1024,
+		MinFreeGiB:     20,
 	}
 }
 
@@ -116,6 +126,9 @@ func (c Config) Validate() error {
 	}
 	if !regexp.MustCompile(`^[a-z][a-z0-9]{0,7}$`).MatchString(c.TapPrefix) {
 		return fmt.Errorf("tap_prefix %q must be 1-8 lowercase letters or digits, starting with a letter", c.TapPrefix)
+	}
+	if c.MaxImageMiB < 64 {
+		return errors.New("max_image_mib must be at least 64")
 	}
 	if c.VCPUs < 1 || c.MemoryMiB < 128 || c.DiskGiB < 1 {
 		return errors.New("vcpus, memory_mib and disk_gib must be positive (memory_mib >= 128)")

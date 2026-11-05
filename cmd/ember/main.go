@@ -19,6 +19,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/danielphan2003/ember/internal/agentbin"
 	"github.com/danielphan2003/ember/internal/config"
@@ -28,6 +29,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/keepalive"
 )
 
 var version = "dev"
@@ -108,7 +110,13 @@ func listen(addr string) (net.Listener, error) {
 }
 
 func newGRPC(srv *server.Server) *grpc.Server {
-	g := grpc.NewServer(grpc.MaxRecvMsgSize(16 << 20))
+	g := grpc.NewServer(
+		grpc.MaxRecvMsgSize(16<<20),
+		// The runner's plugin client pings every 30s, also between calls;
+		// gRPC's default policy (5 min) would answer with GOAWAY
+		// "too_many_pings" and cut the next long step.
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{MinTime: 10 * time.Second, PermitWithoutStream: true}),
+	)
 	pb.RegisterBackendPluginServer(g, srv)
 	h := health.NewServer()
 	h.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
@@ -132,6 +140,13 @@ func cmdServe(args []string) error {
 	if removed, err := srv.Images().Prune(cfg.ImageKeep); err == nil && len(removed) > 0 {
 		log.Info("pruned images", "count", len(removed))
 	}
+	go func() {
+		for range time.Tick(time.Hour) {
+			if removed, err := srv.Images().Prune(cfg.ImageKeep); err == nil && len(removed) > 0 {
+				log.Info("pruned images", "count", len(removed))
+			}
+		}
+	}()
 	lis, err := listen(cfg.Listen)
 	if err != nil {
 		return err
@@ -143,8 +158,9 @@ func cmdServe(args []string) error {
 	go func() {
 		<-ctx.Done()
 		log.Info("shutting down")
-		srv.Shutdown()
+		srv.KillAll() // unblocks calls waiting on guests
 		g.Stop()
+		srv.Shutdown()
 	}()
 	log.Info("ember ready", "version", version, "listen", cfg.Listen, "slots", cfg.Slots)
 	if err := g.Serve(lis); err != nil && !errors.Is(err, grpc.ErrServerStopped) {

@@ -40,9 +40,15 @@ Forgejo ◀──── forgejo-runner ──gRPC (plugin.v1alpha)──▶ embe
   metadata, or IPv6, and they cannot spoof another slot's address. The
   end-to-end test checks each of these from inside a VM.
 - **Privileges.** `ember serve` and every Firecracker process run as the
-  unprivileged `ember` user under a systemd sandbox. The runner runs as a
-  separate user, so a guest that escaped Firecracker would still not hold
-  the Forgejo token.
+  unprivileged `ember` user under a systemd sandbox that may only reach
+  public addresses (job-chosen image references cannot make the host call
+  its own services or the LAN). The runner runs as a separate user with the
+  same address restriction.
+- **If a guest escaped Firecracker** (its seccomp filter and KVM), it would
+  be the `ember` user: no root and no Forgejo token, but it could tamper
+  with the image cache and reach the other VMs and the jobs' environment
+  variables, secrets included. Running each Firecracker under the jailer is
+  on the list; until then, treat all jobs on one host as one trust domain.
 
 ## Install
 
@@ -53,7 +59,7 @@ is handled if present):
 git clone https://github.com/danielphan2003/ember && cd ember
 just build fetch            # needs Go, or podman/docker to build in a container
 sudo deploy/install.sh      # binaries, users, units; starts ember-host and ember
-ember doctor --config /etc/ember/config.yaml
+sudo -u ember ember doctor --config /etc/ember/config.yaml
 ```
 
 `fetch` downloads Firecracker 1.17.0 and Firecracker's CI guest kernel
@@ -95,7 +101,7 @@ jobs:
 ```
 
 A label is `name:plugin://default-image`, and each plugin entry in
-`runner.yaml` can set `vcpus`, `memory_mib`, `disk_gib` or `image`. JavaScript
+`runner.yaml` can set `vcpus`, `memory_mib` and `disk_gib`. JavaScript
 actions need `node` in the image; `docker.io/library/node:*` images and
 Forgejo's runner images have it.
 
@@ -104,7 +110,7 @@ Forgejo's runner images have it.
 `ember run` speaks the same protocol as the runner:
 
 ```sh
-ember run -i docker.io/library/alpine:3.22 -- sh -c 'uname -a; nproc; free -m'
+sudo -u ember ember run -i docker.io/library/alpine:3.22 -- sh -c 'uname -a; nproc; free -m'
 ```
 
 For development, `examples/dev.yaml` keeps everything inside the checkout:
@@ -126,17 +132,22 @@ per VM:
 | Whole job cycle (create, start, `true`, remove), sequential | 0.18–0.21 s |
 | First use of node:24-trixie (1.2 GB): pull and build the filesystem | 36 s, once per digest |
 
-Memory is the real limit on concurrency. Firecracker allocates guest memory
-as it is touched, and a VM waits to start until `MemAvailable` covers its
-size plus `host_reserve_mib`, so an over-subscribed host queues jobs instead
-of swapping.
+Memory is the real limit on concurrency. A VM starts only when its memory
+fits in `memory_budget_mib` (the sum promised to all running VMs) and the
+host's `MemAvailable` still covers it plus `host_reserve_mib`; otherwise the
+job waits. If the kernel still runs out, its OOM killer takes a VM first,
+and ember keeps serving the others.
 
 ## Limitations
 
 - No service containers (`services:`) and no Docker inside jobs yet; the job
-  fails with a clear message if it asks for services.
+  fails with a clear message if it asks for services. A step may start a
+  server in the background (`server &`) and use it in later steps.
+- Guests have no inbound connections and cannot send mail (port 25).
 - The runner's cache server is unreachable from guests, so `actions/cache`
   misses. Large dependencies are better baked into the job image.
+- Images come from public registries; credentials for private ones are not
+  supported yet.
 - x86_64 only (Firecracker supports aarch64; ember has not been tried there).
 - File capabilities and other extended attributes in images are dropped.
 - The plugin protocol is alpha upstream and may change between runner

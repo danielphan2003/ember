@@ -38,5 +38,11 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 SystemCallArchitectures=native
 
+# Jobs choose which actions the runner clones (`uses: http://...`), so it
+# may only talk to public addresses. A Forgejo on your LAN needs its range
+# in IPAddressAllow. 127.0.0.53 is systemd-resolved.
+IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7
+IPAddressAllow=127.0.0.53
+
 [Install]
 WantedBy=multi-user.target

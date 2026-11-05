@@ -40,7 +40,7 @@ func cmdDoctor(args []string) error {
 	check("firecracker at "+cfg.Firecracker, executable(cfg.Firecracker), "run `just fetch` or set firecracker: in the config")
 	_, kerr := os.Stat(cfg.Kernel)
 	check("guest kernel at "+cfg.Kernel, kerr, "run `just fetch` or set kernel: in the config")
-	check("mke2fs can build from a tar (e2fsprogs >= 1.47.1)", mke2fsOK(), "install e2fsprogs 1.47.1+ built with libarchive")
+	check("mke2fs is e2fsprogs 1.47.1 or newer", mke2fsOK(), "install e2fsprogs 1.47.1 or newer")
 	_, rerr := exec.LookPath("resize2fs")
 	check("resize2fs available", rerr, "install e2fsprogs")
 	check("state dir "+cfg.StateDir+" supports reflinks", reflinkOK(cfg.StateDir), "use btrfs or XFS for state_dir (works without, but each job copies the image)")

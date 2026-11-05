@@ -21,6 +21,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	pb "github.com/danielphan2003/ember/internal/pluginpb"
 	"google.golang.org/grpc"
@@ -69,12 +70,14 @@ func (s *Server) Exec(req *pb.ExecRequest, stream grpc.ServerStreamingServer[pb.
 	if dir == "" {
 		dir = "/"
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return sendExecFailed(stream, fmt.Sprintf("create workdir: %v", err))
-	}
-	if cred != nil {
-		// A fresh workdir must be usable by the user the step runs as.
-		_ = os.Chown(dir, int(cred.Uid), int(cred.Gid))
+	if _, err := os.Stat(dir); errors.Is(err, fs.ErrNotExist) {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return sendExecFailed(stream, fmt.Sprintf("create workdir: %v", err))
+		}
+		if cred != nil {
+			// A workdir ember created must be usable by the step's user.
+			_ = os.Chown(dir, int(cred.Uid), int(cred.Gid))
+		}
 	}
 
 	cmd := exec.Command(bin, argv[1:]...)
@@ -83,13 +86,33 @@ func (s *Server) Exec(req *pb.ExecRequest, stream grpc.ServerStreamingServer[pb.
 	cmd.Env = envList(env)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Credential: cred}
 
-	var mu sync.Mutex
-	cmd.Stdout = &chunkWriter{mu: &mu, stream: stream, kind: pb.DataChunk_STDOUT}
-	cmd.Stderr = &chunkWriter{mu: &mu, stream: stream, kind: pb.DataChunk_STDERR}
-
-	if err := cmd.Start(); err != nil {
+	// Real pipes, not io.Writers: cmd.Wait then returns when the step's
+	// process exits, even if a background process it started (`server &`)
+	// still holds the pipes open.
+	out := &execOutput{stream: stream}
+	outR, outW, err := os.Pipe()
+	if err != nil {
 		return sendExecFailed(stream, err.Error())
 	}
+	errR, errW, err := os.Pipe()
+	if err != nil {
+		outR.Close()
+		outW.Close()
+		return sendExecFailed(stream, err.Error())
+	}
+	cmd.Stdout, cmd.Stderr = outW, errW
+	err = cmd.Start()
+	outW.Close()
+	errW.Close()
+	if err != nil {
+		outR.Close()
+		errR.Close()
+		return sendExecFailed(stream, err.Error())
+	}
+	var pumps sync.WaitGroup
+	pumps.Add(2)
+	go out.pump(&pumps, outR, pb.DataChunk_STDOUT)
+	go out.pump(&pumps, errR, pb.DataChunk_STDERR)
 
 	// Cancellation of the stream means the job was cancelled or timed out:
 	// kill the whole process group, not only the direct child.
@@ -104,6 +127,15 @@ func (s *Server) Exec(req *pb.ExecRequest, stream grpc.ServerStreamingServer[pb.
 	waitErr := cmd.Wait()
 	close(done)
 
+	// Let the pipes drain, but do not wait for background processes: after
+	// a short grace period their output is read and dropped.
+	drained := make(chan struct{})
+	go func() { pumps.Wait(); close(drained) }()
+	select {
+	case <-drained:
+	case <-time.After(200 * time.Millisecond):
+	}
+
 	code := 0
 	if waitErr != nil {
 		var exitErr *exec.ExitError
@@ -115,10 +147,44 @@ func (s *Server) Exec(req *pb.ExecRequest, stream grpc.ServerStreamingServer[pb.
 			code = 128 + int(exitErr.Sys().(syscall.WaitStatus).Signal())
 		}
 	}
-	mu.Lock()
-	defer mu.Unlock()
-	return stream.Send(&pb.ExecOutput{Output: &pb.ExecOutput_ExecComplete{
-		ExecComplete: &pb.ExecComplete{ExitCode: int32(code)},
+	return out.complete(int32(code))
+}
+
+// execOutput serialises sends on an Exec stream and stops forwarding once
+// the step has completed.
+type execOutput struct {
+	mu     sync.Mutex
+	stream grpc.ServerStreamingServer[pb.ExecOutput]
+	done   bool
+}
+
+func (o *execOutput) pump(wg *sync.WaitGroup, r *os.File, kind pb.DataChunk_Stream) {
+	defer wg.Done()
+	defer r.Close()
+	buf := make([]byte, 32<<10)
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			o.mu.Lock()
+			if !o.done {
+				_ = o.stream.Send(&pb.ExecOutput{Output: &pb.ExecOutput_Data{
+					Data: &pb.DataChunk{Stream: kind, Data: append([]byte(nil), buf[:n]...)},
+				}})
+			}
+			o.mu.Unlock()
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+func (o *execOutput) complete(code int32) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.done = true
+	return o.stream.Send(&pb.ExecOutput{Output: &pb.ExecOutput_ExecComplete{
+		ExecComplete: &pb.ExecComplete{ExitCode: code},
 	}})
 }
 
@@ -126,24 +192,6 @@ func sendExecFailed(stream grpc.ServerStreamingServer[pb.ExecOutput], msg string
 	return stream.Send(&pb.ExecOutput{Output: &pb.ExecOutput_ExecFailed{
 		ExecFailed: &pb.ExecFailed{ErrorMessage: msg},
 	}})
-}
-
-type chunkWriter struct {
-	mu     *sync.Mutex
-	stream grpc.ServerStreamingServer[pb.ExecOutput]
-	kind   pb.DataChunk_Stream
-}
-
-func (w *chunkWriter) Write(p []byte) (int, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	data := append([]byte(nil), p...)
-	if err := w.stream.Send(&pb.ExecOutput{Output: &pb.ExecOutput_Data{
-		Data: &pb.DataChunk{Stream: w.kind, Data: data},
-	}}); err != nil {
-		return 0, err
-	}
-	return len(p), nil
 }
 
 func envList(env map[string]string) []string {

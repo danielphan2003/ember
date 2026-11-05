@@ -3,6 +3,7 @@ package image
 import (
 	"archive/tar"
 	"bytes"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -39,7 +40,7 @@ func TestExtractRecordsFixups(t *testing.T) {
 		&tar.Header{Name: "bin", Typeflag: tar.TypeSymlink, Linkname: "usr/bin"},
 		&tar.Header{Name: "usr/bin/su2", Typeflag: tar.TypeLink, Linkname: "usr/bin/su"},
 		&tar.Header{Name: ".ember/agent", Typeflag: tar.TypeReg, Mode: 0o755},
-	), dir)
+	), dir, 1<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,11 +76,34 @@ func TestExtractCannotEscapeThroughSymlink(t *testing.T) {
 	_, _, err := extract(layer(t,
 		&tar.Header{Name: "evil", Typeflag: tar.TypeSymlink, Linkname: outside},
 		&tar.Header{Name: "evil/pwned", Typeflag: tar.TypeReg, Mode: 0o644},
-	), dir)
+	), dir, 1<<20)
 	if err == nil {
 		t.Error("expected an error writing through an escaping symlink")
 	}
 	if _, serr := os.Stat(filepath.Join(outside, "pwned")); serr == nil {
 		t.Fatal("extraction wrote outside the root")
+	}
+}
+
+func TestExtractEnforcesSizeLimit(t *testing.T) {
+	_, _, err := extract(layer(t,
+		&tar.Header{Name: "a", Typeflag: tar.TypeReg, Mode: 0o644},
+		&tar.Header{Name: "b", Typeflag: tar.TypeReg, Mode: 0o644},
+	), t.TempDir(), 3) // each file holds 2 bytes
+	if err == nil {
+		t.Fatal("expected the size limit to stop extraction")
+	}
+}
+
+func TestPublicAddr(t *testing.T) {
+	for ip, want := range map[string]bool{
+		"1.1.1.1": true, "2606:4700::1111": true,
+		"127.0.0.1": false, "10.1.2.3": false, "192.168.1.11": false, "172.30.0.1": false,
+		"100.100.100.100": false, "169.254.169.254": false, "::1": false, "fd7a:115c:a1e0::1": false,
+		"fe80::1": false, "::ffff:127.0.0.1": false, "0.0.0.0": false,
+	} {
+		if got := PublicAddr(netip.MustParseAddr(ip)); got != want {
+			t.Errorf("PublicAddr(%s) = %v, want %v", ip, got, want)
+		}
 	}
 }

@@ -39,14 +39,19 @@ const ipForwardSysctl = "/proc/sys/net/ipv4/ip_forward"
 // two ember instances (say, production and a test) never touch each
 // other's rules.
 
-// Ruleset renders the nftables table for cfg.
+// Ruleset renders the nftables table for cfg. Taps are matched by name
+// from a set, not a wildcard, so another instance's taps never match.
 func Ruleset(cfg config.Config) string {
-	var slots []string
+	var taps, slots []string
 	for _, s := range cfg.SlotList() {
+		taps = append(taps, fmt.Sprintf("%q", s.Tap))
 		slots = append(slots, fmt.Sprintf("%q . %s", s.Tap, s.Guest))
 	}
-	taps := cfg.TapPrefix + "*"
 	return fmt.Sprintf(`table inet %[1]s {
+	set taps {
+		type ifname
+		elements = { %[4]s }
+	}
 	set blocked4 {
 		type ipv4_addr
 		flags interval
@@ -58,22 +63,23 @@ func Ruleset(cfg config.Config) string {
 	}
 	chain input {
 		type filter hook input priority filter - 10; policy accept;
-		iifname %[4]q drop
+		iifname @taps drop
 	}
 	chain forward {
 		type filter hook forward priority filter - 10; policy accept;
-		iifname %[4]q meta nfproto ipv6 drop
-		iifname %[4]q iifname . ip saddr != @slots drop
-		iifname %[4]q oifname %[4]q drop
-		iifname %[4]q ip daddr @blocked4 drop
-		oifname %[4]q ct state != { established, related } drop
+		iifname @taps meta nfproto ipv6 drop
+		iifname @taps iifname . ip saddr != @slots drop
+		iifname @taps oifname @taps drop
+		iifname @taps ip daddr @blocked4 drop
+		iifname @taps tcp dport 25 drop
+		oifname @taps ct state != { established, related } drop
 	}
 	chain postrouting {
 		type nat hook postrouting priority srcnat; policy accept;
-		iifname %[4]q oifname != %[4]q masquerade
+		iifname @taps oifname != @taps masquerade
 	}
 }
-`, cfg.TapPrefix, strings.Join(Blocked, ", "), strings.Join(slots, ", "), taps)
+`, cfg.TapPrefix, strings.Join(Blocked, ", "), strings.Join(slots, ", "), strings.Join(taps, ", "))
 }
 
 // Up creates the taps and installs the ruleset. It is idempotent.
@@ -184,33 +190,50 @@ func firewalldRunning() bool {
 	return err == nil && strings.TrimSpace(out) == "running"
 }
 
-// firewalldUp puts the taps in an ACCEPT zone named after the tap prefix.
-// firewalld otherwise rejects forwarded packets; ember's own table still
-// applies its drops first. The bindings are permanent as well as runtime, so
-// a `firewall-cmd --reload` keeps them.
+// firewalldUp puts the taps in a zone named after the tap prefix, with
+// target DROP: if ember's table were ever flushed, the host would still
+// refuse the guests. A policy from that zone to every other zone lets their
+// forwarded traffic through firewalld; ember's table filters it first. The
+// bindings are permanent, so `firewall-cmd --reload` keeps them.
 func firewalldUp(cfg config.Config) error {
-	zone := cfg.TapPrefix
-	zones, _ := run("firewall-cmd", "", "--permanent", "--get-zones")
-	if !strings.Contains(" "+strings.TrimSpace(zones)+" ", " "+zone+" ") {
+	zone, policy := cfg.TapPrefix, cfg.TapPrefix+"-egress"
+	fw := func(args ...string) error {
+		if out, err := run("firewall-cmd", "", args...); err != nil {
+			return fmt.Errorf("firewall-cmd %s: %v: %s", strings.Join(args, " "), err, out)
+		}
+		return nil
+	}
+	has := func(list, name string) bool {
+		out, _ := run("firewall-cmd", "", "--permanent", list)
+		return strings.Contains(" "+strings.TrimSpace(out)+" ", " "+name+" ")
+	}
+	if !has("--get-zones", zone) {
+		if err := fw("--permanent", "--new-zone="+zone); err != nil {
+			return err
+		}
+	}
+	if err := fw("--permanent", "--zone="+zone, "--set-target=DROP"); err != nil {
+		return err
+	}
+	_ = fw("--permanent", "--zone="+zone, "--set-description=ember microVM taps; filtering is in nftables table inet "+zone)
+	if !has("--get-policies", policy) {
 		for _, args := range [][]string{
-			{"--permanent", "--new-zone=" + zone},
-			{"--permanent", "--zone=" + zone, "--set-target=ACCEPT"},
-			{"--permanent", "--zone=" + zone, "--set-description=ember microVM taps; filtering is in nftables table inet " + zone},
+			{"--permanent", "--new-policy=" + policy},
+			{"--permanent", "--policy=" + policy, "--set-target=ACCEPT"},
+			{"--permanent", "--policy=" + policy, "--add-ingress-zone=" + zone},
+			{"--permanent", "--policy=" + policy, "--add-egress-zone=ANY"},
 		} {
-			if out, err := run("firewall-cmd", "", args...); err != nil {
-				return fmt.Errorf("firewall-cmd %s: %v: %s", strings.Join(args, " "), err, out)
+			if err := fw(args...); err != nil {
+				return err
 			}
 		}
 	}
 	for _, s := range cfg.SlotList() {
-		if out, err := run("firewall-cmd", "", "--permanent", "--zone="+zone, "--change-interface="+s.Tap); err != nil {
-			return fmt.Errorf("firewall-cmd --permanent %s: %v: %s", s.Tap, err, out)
+		if err := fw("--permanent", "--zone="+zone, "--change-interface="+s.Tap); err != nil {
+			return err
 		}
 	}
-	if out, err := run("firewall-cmd", "", "--reload"); err != nil {
-		return fmt.Errorf("firewall-cmd --reload: %v: %s", err, out)
-	}
-	return nil
+	return fw("--reload")
 }
 
 func run(name, stdin string, args ...string) (string, error) {

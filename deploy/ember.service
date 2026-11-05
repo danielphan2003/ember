@@ -44,5 +44,20 @@ LockPersonality=yes
 SystemCallArchitectures=native
 UMask=0027
 
+# Image references come from jobs: the host side may only talk to public
+# addresses (ember also checks each registry address). 127.0.0.53 is
+# systemd-resolved. The VMs' traffic goes through taps, not sockets, and is
+# filtered by `ember host up`'s nftables table instead.
+IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7
+IPAddressAllow=127.0.0.53
+
+# The VMs come last: the kernel's OOM killer picks one of them before the
+# host's own services, and losing one VM must not stop ember (and every
+# other VM with it). They also yield CPU and disk to everything else.
+OOMPolicy=continue
+OOMScoreAdjust=500
+CPUWeight=20
+IOWeight=20
+
 [Install]
 WantedBy=multi-user.target

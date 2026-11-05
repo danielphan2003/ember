@@ -79,8 +79,12 @@ func Init() error {
 		_ = os.Remove(link)
 		_ = os.Symlink(target, link)
 	}
-	if err := os.MkdirAll("/tmp", 0o1777); err == nil {
-		_ = os.Chmod("/tmp", 0o1777)
+	// /tmp, and the runner's RUNNER_TEMP and RUNNER_TOOL_CACHE, must be
+	// writable by whatever user the image runs steps as.
+	for _, d := range []string{"/tmp", "/ember/tmp", "/ember/toolcache"} {
+		if err := os.MkdirAll(d, 0o1777); err == nil {
+			_ = os.Chmod(d, 0o1777)
+		}
 	}
 
 	cmdline, err := os.ReadFile("/proc/cmdline")

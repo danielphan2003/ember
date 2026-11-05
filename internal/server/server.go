@@ -16,16 +16,21 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/danielphan2003/ember/internal/config"
 	"github.com/danielphan2003/ember/internal/image"
 	pb "github.com/danielphan2003/ember/internal/pluginpb"
 	"github.com/danielphan2003/ember/internal/vm"
+	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+// defaultLifetime bounds an environment when the runner sends no timeout.
+const defaultLifetime = 6 * time.Hour
 
 // Paths the runner lays files out under inside every VM.
 const (
@@ -44,11 +49,14 @@ type Server struct {
 	slots  chan config.Slot
 	log    *slog.Logger
 
-	// memAvailable reports free host memory in MiB; replaced in tests.
+	// memAvailable and diskFreeGiB report host resources; replaced in tests.
 	memAvailable func() (int, error)
+	diskFreeGiB  func(path string) (int, error)
+	memBudget    int // MiB all VMs together may be given
 
-	mu   sync.Mutex
-	envs map[string]*environment
+	mu        sync.Mutex
+	envs      map[string]*environment
+	committed int // MiB promised to started VMs, guarded by mu
 }
 
 type environment struct {
@@ -61,10 +69,14 @@ type environment struct {
 	diskGiB   int
 	timeout   time.Duration
 
-	slot    *config.Slot
-	machine *vm.Machine
-	img     *image.Image
-	timer   *time.Timer
+	slot     *config.Slot
+	reserved int // MiB counted in Server.committed
+	machine  *vm.Machine
+	// live is the running VM, readable without mu so Remove and Shutdown
+	// can stop a VM whose agent call is stuck while holding mu.
+	live  atomic.Pointer[vm.Machine]
+	img   *image.Image
+	timer *time.Timer
 }
 
 // New builds a server. agent is the ember-agent binary to install in every
@@ -77,11 +89,21 @@ func New(cfg config.Config, agent []byte, log *slog.Logger) *Server {
 			Agent:   agent,
 			Refresh: cfg.ImageRefresh,
 			MinGiB:  cfg.DiskGiB,
+			MaxMiB:  cfg.MaxImageMiB,
 		},
 		slots:        make(chan config.Slot, cfg.Slots),
 		log:          log,
 		memAvailable: memAvailableMiB,
+		diskFreeGiB:  diskFreeGiB,
+		memBudget:    cfg.MemoryBudgetMiB,
 		envs:         map[string]*environment{},
+	}
+	if s.memBudget == 0 {
+		total, err := memTotalMiB()
+		if err != nil {
+			total = cfg.Slots * cfg.MemoryMiB
+		}
+		s.memBudget = max(total-cfg.HostReserveMiB, cfg.MemoryMiB)
 	}
 	for _, sl := range cfg.SlotList() {
 		s.slots <- sl
@@ -99,17 +121,32 @@ func (s *Server) CleanStale() {
 	_ = os.RemoveAll(filepath.Join(s.cfg.StateDir, "vms"))
 }
 
-// Shutdown destroys every running VM.
+// KillAll stops every VM at once without waiting for in-flight calls.
+func (s *Server) KillAll() {
+	for _, e := range s.snapshot() {
+		if m := e.live.Load(); m != nil {
+			m.Kill()
+		}
+	}
+}
+
+// Shutdown destroys every VM and frees its slot. Call it after the gRPC
+// server has stopped, so no Start still holds an environment.
 func (s *Server) Shutdown() {
+	s.KillAll()
+	for _, e := range s.snapshot() {
+		s.destroy(e)
+	}
+}
+
+func (s *Server) snapshot() []*environment {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	envs := make([]*environment, 0, len(s.envs))
 	for _, e := range s.envs {
 		envs = append(envs, e)
 	}
-	s.mu.Unlock()
-	for _, e := range envs {
-		s.destroy(e)
-	}
+	return envs
 }
 
 func (s *Server) Capabilities(context.Context, *pb.CapabilitiesRequest) (*pb.CapabilitiesResponse, error) {
@@ -124,7 +161,7 @@ func (s *Server) Create(_ context.Context, req *pb.CreateRequest) (*pb.CreateRes
 	opts := req.GetBackendOptions()
 	e := &environment{
 		id:        "ember-" + randomHex(6),
-		imageRef:  firstNonEmpty(req.GetImage(), req.GetLabelArg(), opts["image"], s.cfg.DefaultImage),
+		imageRef:  firstNonEmpty(req.GetImage(), req.GetLabelArg(), s.cfg.DefaultImage),
 		vcpus:     s.cfg.VCPUs,
 		memoryMiB: s.cfg.MemoryMiB,
 		diskGiB:   s.cfg.DiskGiB,
@@ -139,6 +176,7 @@ func (s *Server) Create(_ context.Context, req *pb.CreateRequest) (*pb.CreateRes
 	if e.diskGiB, err = intOption(opts, "disk_gib", e.diskGiB, 1, 1024); err != nil {
 		return nil, err
 	}
+	e.timeout = defaultLifetime
 	if d := req.GetEnvironmentTimeout(); d != nil && d.AsDuration() > 0 {
 		e.timeout = d.AsDuration()
 	}
@@ -146,6 +184,15 @@ func (s *Server) Create(_ context.Context, req *pb.CreateRequest) (*pb.CreateRes
 	s.mu.Lock()
 	s.envs[e.id] = e
 	s.mu.Unlock()
+	// The lifetime runs from Create, so an environment whose Remove never
+	// comes (the runner restarted mid-job) still gives its slot back.
+	e.timer = time.AfterFunc(e.timeout, func() {
+		s.log.Warn("environment lifetime exceeded; removing", "env", e.id, "after", e.timeout)
+		if m := e.live.Load(); m != nil {
+			m.Kill()
+		}
+		s.destroy(e)
+	})
 	s.log.Info("create", "env", e.id, "image", e.imageRef, "vcpus", e.vcpus, "memory_mib", e.memoryMiB)
 
 	return &pb.CreateResponse{
@@ -218,6 +265,11 @@ func (s *Server) Start(req *pb.StartRequest, stream grpc.ServerStreamingServer[p
 	defer out.close()
 	began := time.Now()
 
+	if free, err := s.diskFreeGiB(s.cfg.StateDir); err == nil && free < s.cfg.MinFreeGiB {
+		return status.Errorf(codes.ResourceExhausted,
+			"only %d GiB free in %s (min_free_gib is %d); refusing to start a VM", free, s.cfg.StateDir, s.cfg.MinFreeGiB)
+	}
+
 	img, err := s.images.Ensure(ctx, e.imageRef, func(line string) { out.printf("%s", line) })
 	if err != nil {
 		return status.Errorf(codes.FailedPrecondition, "image %s: %v", e.imageRef, err)
@@ -247,26 +299,20 @@ func (s *Server) Start(req *pb.StartRequest, stream grpc.ServerStreamingServer[p
 		Hostname:    e.id,
 	})
 	if err != nil {
-		s.release(e)
+		s.teardownLocked(e)
 		return status.Errorf(codes.Internal, "boot: %v", err)
 	}
 	e.machine = m
+	e.live.Store(m)
 
 	bootCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	err = m.WaitAgent(bootCtx)
 	cancel()
 	if err != nil {
 		tail := m.ConsoleTail(40)
-		s.destroyLocked(e)
+		s.teardownLocked(e) // the runner still sends Remove
 		return status.Errorf(codes.Internal, "microVM did not come up: %v\n--- console (last 40 lines) ---\n%s", err, tail)
 	}
-	if e.timeout > 0 {
-		e.timer = time.AfterFunc(e.timeout, func() {
-			s.log.Warn("environment timeout", "env", e.id, "after", e.timeout)
-			m.Kill()
-		})
-	}
-
 	out.printf("microVM %s ready: %s, %d vCPU, %d MiB; booted in %s (%s total)",
 		e.id, shortDigest(img.Digest), e.vcpus, e.memoryMiB,
 		time.Since(bootStart).Round(time.Millisecond), time.Since(began).Round(time.Millisecond))
@@ -274,35 +320,53 @@ func (s *Server) Start(req *pb.StartRequest, stream grpc.ServerStreamingServer[p
 	return out.complete(imageEnv(img.Env))
 }
 
-// acquire takes a free slot and waits for enough host memory to run the VM.
+// acquire takes a free slot and reserves the VM's memory. It waits while
+// the memory budget is spent or the host is short of memory; meanwhile it
+// holds no slot, so a smaller job can still start.
 func (s *Server) acquire(ctx context.Context, e *environment, out *startLog) (config.Slot, error) {
-	var slot config.Slot
-	select {
-	case slot = <-s.slots:
-	default:
-		out.printf("all %d slots busy; waiting", s.cfg.Slots)
+	if e.memoryMiB > s.memBudget {
+		return config.Slot{}, status.Errorf(codes.InvalidArgument,
+			"job asks for %d MiB, more than the %d MiB budget for all VMs", e.memoryMiB, s.memBudget)
+	}
+	warnedSlots, warnedMem := false, false
+	for {
+		var slot config.Slot
 		select {
 		case slot = <-s.slots:
-		case <-ctx.Done():
-			return slot, status.FromContextError(ctx.Err()).Err()
+		default:
+			if !warnedSlots {
+				out.printf("all %d slots busy; waiting", s.cfg.Slots)
+				warnedSlots = true
+			}
+			select {
+			case slot = <-s.slots:
+			case <-ctx.Done():
+				return slot, status.FromContextError(ctx.Err()).Err()
+			}
 		}
-	}
-	warned := false
-	for {
-		free, err := s.memAvailable()
-		if err != nil || free >= e.memoryMiB+s.cfg.HostReserveMiB {
+		free, ferr := s.memAvailable()
+		s.mu.Lock()
+		ok := s.committed+e.memoryMiB <= s.memBudget &&
+			(ferr != nil || free >= e.memoryMiB+s.cfg.HostReserveMiB)
+		if ok {
+			s.committed += e.memoryMiB
+			e.reserved = e.memoryMiB
+		}
+		committed := s.committed
+		s.mu.Unlock()
+		if ok {
 			return slot, nil
 		}
-		if !warned {
-			out.printf("waiting for memory: %d MiB available, job needs %d MiB plus %d MiB reserve",
-				free, e.memoryMiB, s.cfg.HostReserveMiB)
-			warned = true
+		s.slots <- slot
+		if !warnedMem {
+			out.printf("waiting for memory: %d of %d MiB promised to VMs, %d MiB available on the host; job needs %d MiB",
+				committed, s.memBudget, free, e.memoryMiB)
+			warnedMem = true
 		}
 		select {
 		case <-ctx.Done():
-			s.slots <- slot
 			return slot, status.FromContextError(ctx.Err()).Err()
-		case <-time.After(time.Second):
+		case <-time.After(500 * time.Millisecond):
 		}
 	}
 }
@@ -452,6 +516,11 @@ func (s *Server) Remove(_ context.Context, req *pb.RemoveRequest) (*pb.RemoveRes
 	if err != nil {
 		return nil, err
 	}
+	// Kill first, without the lock: an agent call stuck in a hung guest
+	// holds mu, and killing the VM is what unblocks it.
+	if m := e.live.Load(); m != nil {
+		m.Kill()
+	}
 	s.destroy(e)
 	return &pb.RemoveResponse{}, nil
 }
@@ -462,26 +531,39 @@ func (s *Server) destroy(e *environment) {
 	s.destroyLocked(e)
 }
 
+// destroyLocked tears the environment down and forgets it.
 func (s *Server) destroyLocked(e *environment) {
 	if e.timer != nil {
 		e.timer.Stop()
 	}
+	s.teardownLocked(e)
+	s.mu.Lock()
+	_, known := s.envs[e.id]
+	delete(s.envs, e.id)
+	s.mu.Unlock()
+	if known {
+		s.log.Info("removed", "env", e.id)
+	}
+}
+
+// teardownLocked stops the VM and returns its slot, memory and disk, but
+// keeps the environment known so the runner's Remove still succeeds.
+func (s *Server) teardownLocked(e *environment) {
 	if e.machine != nil {
 		e.machine.Destroy()
 		e.machine = nil
+		e.live.Store(nil)
 	}
-	s.release(e)
-	s.mu.Lock()
-	delete(s.envs, e.id)
-	s.mu.Unlock()
 	_ = os.RemoveAll(s.vmDir(e.id))
-	s.log.Info("removed", "env", e.id)
-}
-
-func (s *Server) release(e *environment) {
 	if e.slot != nil {
 		s.slots <- *e.slot
 		e.slot = nil
+	}
+	if e.reserved > 0 {
+		s.mu.Lock()
+		s.committed -= e.reserved
+		s.mu.Unlock()
+		e.reserved = 0
 	}
 }
 
@@ -528,7 +610,9 @@ func shortDigest(d string) string {
 	return d
 }
 
-func memAvailableMiB() (int, error) {
+func memAvailableMiB() (int, error) { return meminfoMiB("MemAvailable:") }
+
+func meminfoMiB(key string) (int, error) {
 	f, err := os.Open("/proc/meminfo")
 	if err != nil {
 		return 0, err
@@ -536,10 +620,20 @@ func memAvailableMiB() (int, error) {
 	defer f.Close()
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
-		if rest, ok := strings.CutPrefix(sc.Text(), "MemAvailable:"); ok {
+		if rest, ok := strings.CutPrefix(sc.Text(), key); ok {
 			kb, err := strconv.Atoi(strings.TrimSuffix(strings.TrimSpace(rest), " kB"))
 			return kb / 1024, err
 		}
 	}
-	return 0, errors.New("MemAvailable not found")
+	return 0, fmt.Errorf("%s not found in /proc/meminfo", key)
+}
+
+func memTotalMiB() (int, error) { return meminfoMiB("MemTotal:") }
+
+func diskFreeGiB(path string) (int, error) {
+	var st unix.Statfs_t
+	if err := unix.Statfs(path, &st); err != nil {
+		return 0, err
+	}
+	return int(st.Bavail * uint64(st.Bsize) >> 30), nil
 }

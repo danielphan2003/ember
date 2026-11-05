@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -49,11 +50,11 @@ type Machine struct {
 	exited  chan struct{}
 	waitErr error
 	conn    *grpc.ClientConn
+	console *ring
 	Agent   pb.BackendPluginClient
 }
 
-func (s Spec) consolePath() string { return filepath.Join(s.Dir, "console.log") }
-func (s Spec) vsockPath() string   { return filepath.Join(s.Dir, "vsock.sock") }
+func (s Spec) vsockPath() string { return filepath.Join(s.Dir, "vsock.sock") }
 
 // Boot clones the root filesystem and starts Firecracker. It returns once
 // the process is running; use WaitAgent to wait for the guest.
@@ -104,19 +105,19 @@ func Boot(spec Spec) (*Machine, error) {
 		return nil, err
 	}
 
-	console, err := os.Create(spec.consolePath())
-	if err != nil {
-		return nil, err
-	}
-	defer console.Close()
+	// The serial console goes to a bounded ring: a guest flooding ttyS0
+	// must not fill the host disk or ember's memory.
+	console := &ring{max: 64 << 10}
 	cmd := exec.Command(spec.Firecracker, "--no-api", "--config-file", cfgPath, "--level", "Warning")
 	cmd.Dir = spec.Dir
 	cmd.Stdout, cmd.Stderr = console, console
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGKILL}
+	// Its own process group keeps a terminal's Ctrl-C away from the VMs.
+	// Cleanup is ember's job (and systemd's, which kills the whole cgroup).
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start firecracker: %w", err)
 	}
-	m := &Machine{spec: spec, cmd: cmd, exited: make(chan struct{})}
+	m := &Machine{spec: spec, cmd: cmd, exited: make(chan struct{}), console: console}
 	go func() {
 		m.waitErr = cmd.Wait()
 		close(m.exited)
@@ -169,22 +170,46 @@ func (m *Machine) Exited() <-chan struct{} { return m.exited }
 
 // ConsoleTail returns the last n lines of the serial console.
 func (m *Machine) ConsoleTail(n int) string {
-	b, err := os.ReadFile(m.spec.consolePath())
-	if err != nil {
-		return ""
-	}
-	lines := strings.Split(strings.TrimRight(string(b), "\n"), "\n")
+	lines := strings.Split(strings.TrimRight(m.console.String(), "\n"), "\n")
 	if len(lines) > n {
 		lines = lines[len(lines)-n:]
 	}
 	return strings.Join(lines, "\n")
 }
 
-// Kill stops the VM immediately; Destroy still has to clean up.
-func (m *Machine) Kill() {
-	if m.cmd.Process != nil {
-		_ = syscall.Kill(-m.cmd.Process.Pid, syscall.SIGKILL)
+// ring keeps the last max bytes written to it.
+type ring struct {
+	mu  sync.Mutex
+	max int
+	buf []byte
+}
+
+func (r *ring) Write(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.buf = append(r.buf, p...)
+	if over := len(r.buf) - r.max; over > 0 {
+		r.buf = append(r.buf[:0], r.buf[over:]...)
 	}
+	return len(p), nil
+}
+
+func (r *ring) String() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return string(r.buf)
+}
+
+// Kill stops the VM immediately; Destroy still has to clean up. It is
+// safe to call at any time, from any goroutine: os.Process signals through
+// a pidfd, so a recycled PID is never hit.
+func (m *Machine) Kill() {
+	select {
+	case <-m.exited:
+		return
+	default:
+	}
+	_ = m.cmd.Process.Kill()
 }
 
 // Destroy kills the VM and removes its working directory.
@@ -192,9 +217,7 @@ func (m *Machine) Destroy() {
 	if m.conn != nil {
 		_ = m.conn.Close()
 	}
-	if m.cmd.Process != nil {
-		_ = syscall.Kill(-m.cmd.Process.Pid, syscall.SIGKILL)
-	}
+	m.Kill()
 	select {
 	case <-m.exited:
 	case <-time.After(5 * time.Second):

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	pb "github.com/danielphan2003/ember/internal/pluginpb"
 	"google.golang.org/grpc"
@@ -250,5 +251,20 @@ func TestParseCmdline(t *testing.T) {
 	p := ParseCmdline("console=ttyS0 ember.ip=172.30.0.2/30 ember.gw=172.30.0.1 ember.dns=1.1.1.1,9.9.9.9 ember.hostname=job")
 	if p.Addr != "172.30.0.2/30" || p.Gateway != "172.30.0.1" || len(p.DNS) != 2 || p.Hostname != "job" {
 		t.Fatalf("%+v", p)
+	}
+}
+
+func TestExecDoesNotWaitForBackgroundProcesses(t *testing.T) {
+	c := client(t)
+	start := time.Now()
+	out, _, code, failed := run(t, c, &pb.ExecRequest{
+		Command: []string{"sh", "-c", "sleep 5 & echo started"},
+		Workdir: t.TempDir(),
+	})
+	if failed != "" || code != 0 || out != "started\n" {
+		t.Fatalf("got %q code=%d failed=%q", out, code, failed)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("exec waited %s for a background process", d)
 	}
 }
