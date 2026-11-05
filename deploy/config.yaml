@@ -1,0 +1,29 @@
+# /etc/ember/config.yaml. Every key is optional; these are the defaults.
+# After changing slots, tap_prefix or subnet: systemctl restart ember-host ember
+
+# Keep this a unix socket: the protocol has no authentication, so anyone
+# who can reach a TCP listener can run VMs.
+listen: unix:///run/ember/ember.sock
+state_dir: /var/lib/ember            # image cache and VM disks; btrfs or XFS for instant clones
+firecracker: /usr/local/lib/ember/firecracker
+kernel: /usr/local/lib/ember/vmlinux
+user: ember
+
+# Concurrent VMs. Set the runner's capacity to the same number.
+slots: 8
+tap_prefix: ember                    # also names the nftables table and firewalld zone
+subnet: 172.30.0.0/16                # one /30 per slot
+dns: [1.1.1.1, 9.9.9.9]              # guests cannot reach the host, so use public resolvers
+
+default_image: docker.io/library/node:24-trixie
+image_refresh: 1h                    # how long a tag's digest is trusted
+image_keep: 168h                     # delete cached images unused this long
+max_image_mib: 16384                 # refuse images larger than this unpacked
+
+# VM size when the runner's plugin options set none.
+vcpus: 2
+memory_mib: 2048
+disk_gib: 16
+host_reserve_mib: 1024               # a VM waits until MemAvailable covers it plus this
+memory_budget_mib: 0                 # memory promised to all VMs at once; 0 = MemTotal - host_reserve_mib
+min_free_gib: 20                     # no VM starts while state_dir has less free space

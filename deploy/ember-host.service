@@ -1,0 +1,15 @@
+[Unit]
+Description=ember host network: tap devices and firewall rules for the microVMs
+Documentation=https://github.com/danielphan2003/ember
+After=network-pre.target firewalld.service
+Wants=network-pre.target
+Before=ember.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/ember host up --config /etc/ember/config.yaml
+ExecStop=/usr/local/bin/ember host down --config /etc/ember/config.yaml
+
+[Install]
+WantedBy=multi-user.target

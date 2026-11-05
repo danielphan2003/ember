@@ -1,0 +1,63 @@
+[Unit]
+Description=ember: Forgejo Actions jobs in Firecracker microVMs
+Documentation=https://github.com/danielphan2003/ember
+Requires=ember-host.service
+After=ember-host.service network-online.target
+Wants=network-online.target
+
+[Service]
+User=ember
+Group=ember
+ExecStart=/usr/local/bin/ember serve --config /etc/ember/config.yaml
+RuntimeDirectory=ember
+RuntimeDirectoryMode=0750
+StateDirectory=ember
+StateDirectoryMode=0750
+Restart=on-failure
+RestartSec=2
+# Stopping kills every VM in the cgroup.
+KillMode=control-group
+TimeoutStopSec=30
+
+# Sandbox. Firecracker needs /dev/kvm and the taps (/dev/net/tun); mke2fs
+# needs an unprivileged user namespace to build root filesystems.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+DevicePolicy=closed
+DeviceAllow=/dev/kvm rw
+DeviceAllow=/dev/net/tun rw
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=user
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+UMask=0027
+
+# Image references come from jobs: the host side may only talk to public
+# addresses (ember also checks each registry address). 127.0.0.53 is
+# systemd-resolved. The VMs' traffic goes through taps, not sockets, and is
+# filtered by `ember host up`'s nftables table instead.
+IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7
+IPAddressAllow=127.0.0.53
+
+# The VMs come last: the kernel's OOM killer picks one of them before the
+# host's own services, and losing one VM must not stop ember (and every
+# other VM with it). They also yield CPU and disk to everything else.
+OOMPolicy=continue
+OOMScoreAdjust=500
+CPUWeight=20
+IOWeight=20
+
+[Install]
+WantedBy=multi-user.target

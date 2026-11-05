@@ -1,3 +1,3 @@
 /dist/
-/internal/agentbin/bin/ember-agent
+/target/
 /.ember-dev/

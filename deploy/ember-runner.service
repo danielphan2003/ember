@@ -1,0 +1,48 @@
+[Unit]
+Description=Forgejo runner whose jobs run in ember microVMs
+Documentation=https://github.com/danielphan2003/ember
+Wants=ember.service network-online.target
+After=ember.service network-online.target
+
+[Service]
+User=forgejo-runner
+Group=forgejo-runner
+SupplementaryGroups=ember
+StateDirectory=forgejo-runner
+WorkingDirectory=/var/lib/forgejo-runner
+Environment=HOME=/var/lib/forgejo-runner
+ExecStart=/usr/local/bin/forgejo-runner --config /etc/ember/runner.yaml daemon
+# The token is a systemd credential, encrypted to this host (TPM when there
+# is one): see "Connect to Forgejo" in the README.
+LoadCredentialEncrypted=forgejo-token:/etc/ember/forgejo-token.cred
+Restart=on-failure
+RestartSec=5
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+
+# Jobs choose which actions the runner clones (`uses: http://...`), so it
+# may only talk to public addresses. A Forgejo on your LAN needs its range
+# in IPAddressAllow. 127.0.0.53 is systemd-resolved.
+IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7
+IPAddressAllow=127.0.0.53
+
+[Install]
+WantedBy=multi-user.target
