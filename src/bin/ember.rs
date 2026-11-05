@@ -77,7 +77,11 @@ fn main() {
     let cli = Cli::parse();
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     if let Err(e) = rt.block_on(dispatch(cli)) {
-        eprintln!("ember: {e:#}");
+        // gRPC errors read best as their message alone.
+        match e.downcast_ref::<tonic::Status>() {
+            Some(s) => eprintln!("ember: {}", s.message()),
+            None => eprintln!("ember: {e:#}"),
+        }
         std::process::exit(1);
     }
 }
@@ -121,7 +125,13 @@ fn preflight(cfg: &Config) -> Result<()> {
 }
 
 async fn serve(cfg: Config) -> Result<()> {
-    tracing_subscriber::fmt().with_target(false).init();
+    use std::io::IsTerminal;
+    // No colour codes in the journal.
+    tracing_subscriber::fmt()
+        .with_target(false)
+        .with_ansi(std::io::stderr().is_terminal())
+        .with_writer(std::io::stderr)
+        .init();
     preflight(&cfg)?;
     let server = Server::new(cfg.clone(), AGENT)?;
     server.clean_stale();

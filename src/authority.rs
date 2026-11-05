@@ -33,13 +33,21 @@ impl tonic::transport::server::Connected for Conn {
 }
 
 impl AsyncRead for Conn {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         Pin::new(&mut self.0).poll_read(cx, buf)
     }
 }
 
 impl AsyncWrite for Conn {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         Pin::new(&mut self.0).poll_write(cx, buf)
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -70,7 +78,10 @@ where
 }
 
 /// Copies client frames to the server, repairing header blocks.
-pub async fn rewrite(r: &mut (impl AsyncRead + Unpin), w: &mut (impl AsyncWrite + Unpin)) -> io::Result<()> {
+pub async fn rewrite(
+    r: &mut (impl AsyncRead + Unpin),
+    w: &mut (impl AsyncWrite + Unpin),
+) -> io::Result<()> {
     let mut preface = [0u8; 24];
     r.read_exact(&mut preface).await?;
     w.write_all(&preface).await?;
@@ -82,7 +93,9 @@ pub async fn rewrite(r: &mut (impl AsyncRead + Unpin), w: &mut (impl AsyncWrite 
     let mut decoder = hpack::Decoder::new();
     let mut encoder = hpack::Encoder::new();
     loop {
-        let Some((kind, flags, stream, payload)) = read_frame(r).await? else { return Ok(()) };
+        let Some((kind, flags, stream, payload)) = read_frame(r).await? else {
+            return Ok(());
+        };
         if kind != HEADERS {
             write_frame(w, kind, flags, stream, &payload).await?;
             continue;
@@ -90,14 +103,18 @@ pub async fn rewrite(r: &mut (impl AsyncRead + Unpin), w: &mut (impl AsyncWrite 
         let mut block = header_fragment(flags, &payload)?;
         let mut end = flags & END_HEADERS != 0;
         while !end {
-            let (k, f, s, p) = read_frame(r).await?.ok_or_else(|| bad("eof inside a header block"))?;
+            let (k, f, s, p) = read_frame(r)
+                .await?
+                .ok_or_else(|| bad("eof inside a header block"))?;
             if k != CONTINUATION || s != stream {
                 return Err(bad("expected CONTINUATION"));
             }
             block.extend_from_slice(&p);
             end = f & END_HEADERS != 0;
         }
-        let mut headers = decoder.decode(&block).map_err(|e| bad(&format!("hpack: {e:?}")))?;
+        let mut headers = decoder
+            .decode(&block)
+            .map_err(|e| bad(&format!("hpack: {e:?}")))?;
         for (name, value) in headers.iter_mut() {
             if name == b":authority" && http::uri::Authority::try_from(value.as_slice()).is_err() {
                 *value = b"localhost".to_vec();
@@ -109,7 +126,12 @@ pub async fn rewrite(r: &mut (impl AsyncRead + Unpin), w: &mut (impl AsyncWrite 
         while let Some(chunk) = chunks.next() {
             let last = chunks.peek().is_none();
             let mut f = if last { END_HEADERS } else { 0 };
-            let k = if first { f |= flags & END_STREAM; HEADERS } else { CONTINUATION };
+            let k = if first {
+                f |= flags & END_STREAM;
+                HEADERS
+            } else {
+                CONTINUATION
+            };
             write_frame(w, k, f, stream, chunk).await?;
             first = false;
         }
@@ -136,7 +158,9 @@ fn header_fragment(flags: u8, payload: &[u8]) -> io::Result<Vec<u8>> {
     Ok(p[..len].to_vec())
 }
 
-async fn read_frame(r: &mut (impl AsyncRead + Unpin)) -> io::Result<Option<(u8, u8, u32, Vec<u8>)>> {
+async fn read_frame(
+    r: &mut (impl AsyncRead + Unpin),
+) -> io::Result<Option<(u8, u8, u32, Vec<u8>)>> {
     let mut h = [0u8; 9];
     match r.read_exact(&mut h).await {
         Ok(_) => {}
@@ -153,7 +177,13 @@ async fn read_frame(r: &mut (impl AsyncRead + Unpin)) -> io::Result<Option<(u8, 
     Ok(Some((h[3], h[4], stream, payload)))
 }
 
-async fn write_frame(w: &mut (impl AsyncWrite + Unpin), kind: u8, flags: u8, stream: u32, payload: &[u8]) -> io::Result<()> {
+async fn write_frame(
+    w: &mut (impl AsyncWrite + Unpin),
+    kind: u8,
+    flags: u8,
+    stream: u32,
+    payload: &[u8],
+) -> io::Result<()> {
     let len = (payload.len() as u32).to_be_bytes();
     let mut h = [len[1], len[2], len[3], kind, flags, 0, 0, 0, 0];
     h[5..].copy_from_slice(&stream.to_be_bytes());
@@ -180,7 +210,11 @@ mod tests {
         let mut first = vec![2u8];
         first.extend_from_slice(a);
         first.extend_from_slice(&[0, 0]);
-        for (kind, flags, payload) in [(HEADERS, PADDED, first), (CONTINUATION, END_HEADERS, b.to_vec()), (0x0, END_STREAM, b"hi".to_vec())] {
+        for (kind, flags, payload) in [
+            (HEADERS, PADDED, first),
+            (CONTINUATION, END_HEADERS, b.to_vec()),
+            (0x0, END_STREAM, b"hi".to_vec()),
+        ] {
             let len = (payload.len() as u32).to_be_bytes();
             input.extend_from_slice(&[len[1], len[2], len[3], kind, flags, 0, 0, 0, 1]);
             input.extend_from_slice(&payload);
@@ -190,7 +224,10 @@ mod tests {
         assert_eq!(&out[..24], PREFACE);
         let mut r = &out[24..];
         let (kind, flags, stream, payload) = read_frame(&mut r).await.unwrap().unwrap();
-        assert_eq!((kind, flags & END_HEADERS, stream), (HEADERS, END_HEADERS, 1));
+        assert_eq!(
+            (kind, flags & END_HEADERS, stream),
+            (HEADERS, END_HEADERS, 1)
+        );
         let headers = hpack::Decoder::new().decode(&payload).unwrap();
         let authority = headers.iter().find(|(n, _)| n == b":authority").unwrap();
         assert_eq!(authority.1, b"localhost");
