@@ -110,7 +110,9 @@ pub fn boot(spec: &Spec) -> Result<Machine> {
     // A pidfd names this process, never a later one that reuses its PID.
     let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
     if raw < 0 {
-        return Err(io::Error::last_os_error()).context("pidfd_open");
+        let err = io::Error::last_os_error();
+        let _ = child.start_kill(); // never leave a VM nobody can stop
+        return Err(err).context("pidfd_open");
     }
     let pidfd = Arc::new(unsafe { OwnedFd::from_raw_fd(raw as i32) });
 

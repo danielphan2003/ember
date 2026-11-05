@@ -330,7 +330,16 @@ impl Server {
             dns: cfg.dns.clone(),
             hostname: e.id.clone(),
         };
-        let machine = vm::boot(&spec).map_err(|err| Status::internal(format!("boot: {err:#}")))?;
+        // Cloning (or copying, without reflinks) and resize2fs are disk work:
+        // keep them off the async workers.
+        let rt = tokio::runtime::Handle::current();
+        let machine = tokio::task::spawn_blocking(move || {
+            let _guard = rt.enter(); // boot spawns tasks for the console and exit
+            vm::boot(&spec)
+        })
+        .await
+        .map_err(|err| Status::internal(format!("boot: {err}")))?
+        .map_err(|err| Status::internal(format!("boot: {err:#}")))?;
         *e.killer.lock().unwrap() = Some(machine.killer());
         let machine = st.machine.insert(machine);
         if let Err(err) = machine.wait_agent(Duration::from_secs(60)).await {
@@ -648,14 +657,13 @@ impl pb::backend_plugin_server::BackendPlugin for Server {
         let mut stream = agent
             .copy_out(req)
             .await
-            .map_err(|s| Status::internal(format!("copyout: {}", Server::vm_gone(&st, s))))?
+            .map_err(|s| copy_out_error(&st, s))?
             .into_inner();
         let (tx, rx) = mpsc::channel(8);
         tokio::spawn(async move {
             let st = st;
             while let Some(item) = stream.next().await {
-                let item = item
-                    .map_err(|s| Status::internal(format!("copyout: {}", Server::vm_gone(&st, s))));
+                let item = item.map_err(|s| copy_out_error(&st, s));
                 let stop = item.is_err();
                 if tx.send(item).await.is_err() || stop {
                     return;
@@ -675,6 +683,15 @@ impl pb::backend_plugin_server::BackendPlugin for Server {
         self.destroy(&e).await;
         Ok(Response::new(RemoveResponse {}))
     }
+}
+
+/// Keeps NotFound (the runner reads it as "no such file"); anything else
+/// becomes Internal with the VM's state.
+fn copy_out_error(st: &State, s: Status) -> Status {
+    if s.code() == Code::NotFound {
+        return s;
+    }
+    Status::internal(format!("copyout: {}", Server::vm_gone(st, s)))
 }
 
 fn int_option(

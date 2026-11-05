@@ -7,7 +7,6 @@ use std::{
     io::{self, Read, Write},
     os::unix::fs::PermissionsExt,
     path::{Component, Path, PathBuf},
-    sync::mpsc::Receiver,
 };
 
 use cap_std::{ambient_authority, fs::Dir};
@@ -18,13 +17,14 @@ use crate::pb::CopyOutChunk;
 
 /// Reads the byte chunks a CopyIn stream delivers.
 pub struct ChanReader {
-    rx: Receiver<Vec<u8>>,
+    rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     buf: Vec<u8>,
     pos: usize,
 }
 
 impl ChanReader {
-    pub fn new(rx: Receiver<Vec<u8>>) -> Self {
+    /// Use from a blocking task: reads block on the channel.
+    pub fn new(rx: tokio::sync::mpsc::Receiver<Vec<u8>>) -> Self {
         Self {
             rx,
             buf: Vec::new(),
@@ -36,12 +36,12 @@ impl ChanReader {
 impl Read for ChanReader {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         while self.pos == self.buf.len() {
-            match self.rx.recv() {
-                Ok(b) => {
+            match self.rx.blocking_recv() {
+                Some(b) => {
                     self.buf = b;
                     self.pos = 0;
                 }
-                Err(_) => return Ok(0),
+                None => return Ok(0),
             }
         }
         let n = out.len().min(self.buf.len() - self.pos);

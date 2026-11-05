@@ -96,7 +96,7 @@ impl pb::backend_plugin_server::BackendPlugin for Agent {
             .dest_path
             .clone()
             .ok_or_else(|| Status::invalid_argument("copyin: first chunk has no dest_path"))?;
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(16);
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(16);
         let untar = tokio::task::spawn_blocking(move || {
             tarfs::untar(tarfs::ChanReader::new(rx), Path::new(&dest))
         });
@@ -114,7 +114,7 @@ impl pb::backend_plugin_server::BackendPlugin for Agent {
                     None => break,
                 },
             };
-            if !data.is_empty() && tx.send(data).is_err() {
+            if !data.is_empty() && tx.send(data).await.is_err() {
                 break; // untar stopped early; its error is reported below
             }
         }
@@ -181,8 +181,9 @@ async fn run(req: ExecRequest, out: Arc<ExecSink>, watcher: ExecTx) -> Result<()
         return Err("empty command".into());
     };
     let mut env = req.env;
-    env.entry("PATH".into())
-        .or_insert_with(|| DEFAULT_PATH.into());
+    if env.get("PATH").is_none_or(|p| p.is_empty()) {
+        env.insert("PATH".into(), DEFAULT_PATH.into());
+    }
     let user = lookup_user(req.user.as_deref().unwrap_or(""))?;
     if let Some(home) = &user.home {
         env.entry("HOME".into()).or_insert_with(|| home.clone());

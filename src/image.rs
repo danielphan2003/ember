@@ -231,11 +231,14 @@ impl Store {
         fs::create_dir(&tree)?;
 
         let mut unpack = Unpack::new(&tree, self.max_bytes)?;
+        // Compressed layers count against the same budget as the unpacked
+        // image, so a hostile image cannot fill the disk with downloads.
+        let mut downloaded = 0u64;
         for (i, layer) in resolved.layers.iter().enumerate() {
             let mut blob = tempfile::tempfile_in(tmp.path())?;
-            self.client
-                .blob(r, layer, self.max_bytes, &mut blob)
-                .await?;
+            let budget = self.max_bytes.saturating_sub(downloaded);
+            self.client.blob(r, layer, budget, &mut blob).await?;
+            downloaded += blob.metadata()?.len();
             blob.rewind()?;
             let (layer, n) = (layer.clone(), resolved.layers.len());
             unpack = tokio::task::spawn_blocking(move || -> Result<Unpack> {

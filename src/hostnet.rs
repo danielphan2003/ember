@@ -8,7 +8,8 @@
 //! - nor each other, private networks, the tailnet's CGNAT range,
 //!   link-local or multicast addresses,
 //! - guests have no IPv6 and only TCP, UDP and ICMP (no 6in4 or GRE
-//!   tunnels), at most 4096 tracked connections each, and no SMTP,
+//!   tunnels), at most 4096 tracked connections each, and no port 25 (mail
+//!   relaying from your address),
 //! - a guest can only send from its own address,
 //! - everything else is masqueraded to the internet.
 //!

@@ -23,6 +23,10 @@ const END_HEADERS: u8 = 0x4;
 const PADDED: u8 = 0x8;
 const PRIORITY: u8 = 0x20;
 const MAX_FRAME: usize = 16384; // the HTTP/2 default; h2 never lowers it
+// The re-encoded blocks use hpack's default 4096-byte dynamic table, which
+// is h2's default decoder size too; h2 does not shrink it, so the two stay
+// in sync. The client's own table size only affects our decoder, which
+// follows the size updates the client encodes in its blocks.
 
 /// The server side of a repaired connection.
 pub struct Conn(DuplexStream);
