@@ -1,26 +1,28 @@
-# ember tasks. Go runs in a container when it is not installed, so a stock
-# host needs only podman (or docker) and just.
+# ember tasks. Cargo runs in a container when it is not installed, so a
+# stock host needs only podman (or docker) and just.
 
 firecracker_version := "v1.17.0"
 firecracker_sha256 := "06094a1108ae9e82aa4c23a775aa92758f53f1175d422270d9d6162cb9ade558"
 kernel_url := "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.14/x86_64/vmlinux-6.1.155"
 kernel_sha256 := "e41c7048bd2475e7e788153823fcb9166a7e0b78c4c443bd6446d015fa735f53"
-version := `git describe --tags --always --dirty 2>/dev/null || echo dev`
+target := "x86_64-unknown-linux-musl"
 
-# Build dist/ember with the guest agent embedded.
+# Build dist/ember: static binaries, with the guest agent embedded.
 build:
     mkdir -p dist
-    CGO_ENABLED=0 scripts/go build -trimpath -ldflags="-s -w" -o internal/agentbin/bin/ember-agent ./cmd/ember-agent
-    CGO_ENABLED=0 scripts/go build -trimpath -ldflags="-s -w -X main.version={{version}}" -o dist/ember ./cmd/ember
+    scripts/cargo build --release --locked --target {{target}} --bin ember-agent
+    EMBER_AGENT=target/{{target}}/release/ember-agent scripts/cargo build --release --locked --target {{target}} --bin ember
+    cp target/{{target}}/release/ember dist/ember
+    ls -l dist/ember
 
-# Format, vet and test. CI runs this.
+# Format check, clippy and tests. CI runs this.
 check:
-    scripts/go vet ./...
-    scripts/go test ./...
-    test -z "$(scripts/go run golang.org/x/tools/cmd/goimports@v0.38.0 -l .)" || (echo "run: just fmt"; exit 1)
+    scripts/cargo fmt --check
+    scripts/cargo clippy --locked --all-targets -- -D warnings
+    scripts/cargo test --locked
 
 fmt:
-    scripts/go run golang.org/x/tools/cmd/goimports@v0.38.0 -w .
+    scripts/cargo fmt
 
 # Download Firecracker and the guest kernel into dist/, verified by sha256.
 fetch:
@@ -44,5 +46,8 @@ fetch:
 # Boot real VMs: needs /dev/kvm, `just fetch`, `sudo dist/ember host up --config CONFIG`,
 # and no `ember serve` on the same slots. The test binary runs natively for /dev/kvm.
 e2e config="examples/dev.yaml": build
-    CGO_ENABLED=0 scripts/go test -c -o dist/e2e.test ./e2e
-    EMBER_E2E_CONFIG={{config}} dist/e2e.test -test.v -test.count=1
+    #!/usr/bin/env sh
+    set -eu
+    EMBER_AGENT=target/{{target}}/release/ember-agent scripts/cargo test --release --locked --target {{target}} --test e2e --no-run 2>&1 | tail -1
+    bin=$(ls -t target/{{target}}/release/deps/e2e-* | grep -v '\.d$' | head -1)
+    EMBER_E2E_CONFIG={{config}} "$bin" --test-threads=1 --nocapture

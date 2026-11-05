@@ -3,7 +3,7 @@
 Run Forgejo Actions jobs in Firecracker microVMs. Each job gets its own
 kernel, a copy-on-write clone of its image's root filesystem, and a network
 that reaches the internet but not your host or LAN. A VM is ready about
-150 ms after the runner asks for it, so a fleet of agents can push every
+120 ms after the runner asks for it, so a fleet of agents can push every
 minute without queueing behind container start-up or sharing a Docker
 daemon.
 
@@ -60,7 +60,7 @@ is handled if present):
 
 ```sh
 git clone https://github.com/danielphan2003/ember && cd ember
-just build fetch            # needs Go, or podman/docker to build in a container
+just build fetch            # needs Rust, or podman/docker to build in a container
 sudo deploy/install.sh      # binaries, users, units; starts ember-host and ember
 sudo -u ember ember doctor --config /etc/ember/config.yaml
 ```
@@ -131,8 +131,8 @@ per VM:
 
 | | |
 | --- | --- |
-| Create → agent ready, image cached | 145–185 ms (alpine:3.22 and node:24-trixie alike) |
-| Whole job cycle (create, start, `true`, remove), sequential | 0.18–0.21 s |
+| Create → agent ready, image cached | 105–135 ms (alpine:3.22 and node:24-trixie alike) |
+| Whole job cycle (create, start, `true`, remove), sequential | about 0.18 s |
 | First use of node:24-trixie (1.2 GB): pull and build the filesystem | 36 s, once per digest |
 
 Memory is the real limit on concurrency. A VM starts only when its memory
@@ -158,13 +158,21 @@ and ember keeps serving the others.
 
 ## Development
 
+ember is Rust: one crate, two static (musl) binaries. `ember-agent` is
+embedded in `ember` at build time.
+
 ```sh
-just check   # go vet, unit tests, goimports
+just check   # rustfmt, clippy -D warnings, unit and agent tests
 just e2e     # boots real VMs: needs /dev/kvm, `just fetch` and the dev host network
 ```
 
-`scripts/go` runs Go in a container when it is not installed, so `just`
-recipes work on a host with only podman or docker.
+`scripts/cargo` runs cargo in a container when it is not installed, so
+`just` recipes work on a host with only podman or docker.
+
+One interoperability detail: the runner's Go gRPC client sends the unix
+socket path as the HTTP/2 `:authority`, which Rust's h2 rejects.
+`src/authority.rs` repairs the header on ember's socket, so any socket path
+works in `runner.yaml`.
 
 ## Related work
 
@@ -175,10 +183,11 @@ recipes work on a host with only podman or docker.
 - [weft-runner-forgejo](https://github.com/openweft/weft-runner-forgejo): a
   separate runner implementation that runs `act_runner` inside weft microVMs.
 
-ember is smaller than either: one binary, the stock runner, no containerd or
-cluster, and guests with filtered internet access.
+ember is smaller than either: one static binary, the stock runner, no
+containerd or cluster, and guests with filtered internet access.
 
 ## License
 
-MIT. `internal/pluginpb` is generated from Forgejo's MIT-licensed
-`plugin.proto` (copyright The Forgejo Authors).
+MIT. `proto/plugin.proto` is Forgejo's MIT-licensed plugin definition
+(copyright The Forgejo Authors); the gRPC code is generated from it at
+build time.
