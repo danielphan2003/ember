@@ -179,6 +179,8 @@ impl ExecSink {
                     output: Some(exec_output::Output::Data(chunk)),
                 }))
                 .await;
+            // Again after the send: one held up by backpressure is not idle.
+            *self.last.lock().unwrap() = std::time::Instant::now();
         }
     }
 

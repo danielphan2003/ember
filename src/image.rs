@@ -442,6 +442,7 @@ pub struct Unpack {
 /// Largest GNU long name or PAX header accepted. The tar crate would read
 /// any size into memory; these are a few hundred bytes in real images.
 const MAX_META: u64 = 1 << 20;
+const PATH_MAX: usize = 4096;
 
 impl Unpack {
     pub fn new(tree: &Path, limit: u64, cancel: Arc<AtomicBool>) -> Result<Self> {
@@ -477,18 +478,20 @@ impl Unpack {
     /// Creates a directory and any missing ancestors as 0755, whatever the
     /// process umask: layers often omit entries for parent directories.
     fn ensure_dir(&self, dir: &Path) -> Result<()> {
-        if self.root.symlink_metadata(dir).is_ok() {
-            return Ok(());
+        // A loop, not recursion: a hostile path may have thousands of
+        // components.
+        let missing: Vec<&Path> = dir
+            .ancestors()
+            .take_while(|a| !a.as_os_str().is_empty() && self.root.symlink_metadata(a).is_err())
+            .collect();
+        for d in missing.into_iter().rev() {
+            if let Err(e) = self.root.create_dir(d)
+                && e.kind() != io::ErrorKind::AlreadyExists
+            {
+                return Err(e.into());
+            }
+            self.root.set_permissions(d, perms(0o755))?;
         }
-        if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
-            self.ensure_dir(parent)?;
-        }
-        if let Err(e) = self.root.create_dir(dir)
-            && e.kind() != io::ErrorKind::AlreadyExists
-        {
-            return Err(e.into());
-        }
-        self.root.set_permissions(dir, perms(0o755))?;
         Ok(())
     }
 
@@ -499,12 +502,19 @@ impl Unpack {
         let mut added: HashSet<PathBuf> = HashSet::new();
         let (mut long_name, mut long_link): (Option<PathBuf>, Option<PathBuf>) = (None, None);
         let mut pax_size: Option<u64> = None;
+        // Owners too large for the header field (over 2097151) come in PAX.
+        let (mut pax_uid, mut pax_gid): (Option<u64>, Option<u64>) = (None, None);
         for entry in ar.entries()?.raw(true) {
             if self.cancel.load(Ordering::Relaxed) {
                 bail!("cancelled");
             }
             let mut e = entry?;
             let kind = e.header().entry_type();
+            // Registry layers never use sparse members; refuse rather than
+            // silently drop or misread them.
+            if kind.is_gnu_sparse() {
+                bail!("sparse tar members are not supported");
+            }
             if kind.is_gnu_longname()
                 || kind.is_gnu_longlink()
                 || kind.is_pax_local_extensions()
@@ -530,7 +540,19 @@ impl Unpack {
                         match ext.key() {
                             Ok("path") => long_name = Some(text(ext.value_bytes())),
                             Ok("linkpath") => long_link = Some(text(ext.value_bytes())),
-                            Ok("size") => pax_size = ext.value().ok().and_then(|v| v.parse().ok()),
+                            Ok(k @ ("uid" | "gid")) => {
+                                let v = ext.value().ok().and_then(|v| v.parse().ok());
+                                let v = Some(v.ok_or_else(|| anyhow!("unparseable PAX {k}"))?);
+                                if k == "uid" {
+                                    pax_uid = v;
+                                } else {
+                                    pax_gid = v;
+                                }
+                            }
+                            Ok("size") => {
+                                let v = ext.value().ok().and_then(|v| v.parse().ok());
+                                pax_size = Some(v.ok_or_else(|| anyhow!("unparseable PAX size"))?);
+                            }
                             _ => {}
                         }
                     }
@@ -550,8 +572,15 @@ impl Unpack {
                 Some(p) => Some(p),
                 None => e.link_name()?.map(|l| l.into_owned()),
             };
+            // The kernel cannot use longer paths anyway.
+            for p in std::iter::once(&path).chain(link.as_ref()) {
+                if p.as_os_str().len() > PATH_MAX {
+                    bail!("tar entry path over {PATH_MAX} bytes");
+                }
+            }
+            let owner = (pax_uid.take(), pax_gid.take());
             let shown = path.display().to_string();
-            self.entry(&mut e, &path, link, &mut added)
+            self.entry(&mut e, &path, link, owner, &mut added)
                 .with_context(|| format!("unpack {shown}"))?;
         }
         Ok(())
@@ -562,6 +591,7 @@ impl Unpack {
         e: &mut tar::Entry<R>,
         raw_path: &Path,
         link: Option<PathBuf>,
+        owner: (Option<u64>, Option<u64>),
         added: &mut HashSet<PathBuf>,
     ) -> Result<()> {
         {
@@ -652,7 +682,8 @@ impl Unpack {
                 };
             self.size += 512;
             let perm = if ftype == libc::S_IFLNK { 0o777 } else { perm };
-            let (uid, gid) = (h.uid().unwrap_or(0), h.gid().unwrap_or(0));
+            let uid = owner.0.unwrap_or_else(|| h.uid().unwrap_or(0));
+            let gid = owner.1.unwrap_or_else(|| h.gid().unwrap_or(0));
             if uid != 0 || gid != 0 || perm != written {
                 let p = format!("/{}", path.display());
                 self.fixups.insert(
@@ -983,6 +1014,49 @@ mod tests {
         let mut b = tar::Builder::new(Vec::new());
         b.append(&h, &vec![b'a'; 2 << 20][..]).unwrap();
         let mut u = Unpack::new(dir.path(), 1 << 30, Default::default()).unwrap();
+        assert!(u.layer(&b.into_inner().unwrap()[..]).is_err());
+    }
+
+    #[test]
+    fn removing_a_directory_drops_only_its_fixups() {
+        // Path orders by component, so "usr/..." sorts before "usr0".
+        let dir = tempfile::tempdir().unwrap();
+        let mut u = Unpack::new(dir.path(), 1 << 20, Default::default()).unwrap();
+        u.layer(
+            &layer(&[
+                ("usr/x", F, 0o640, 0, 42, ""),
+                ("usr/y/z", F, 0o640, 0, 42, ""),
+                ("usr0", F, 0o640, 0, 42, ""),
+            ])[..],
+        )
+        .unwrap();
+        u.layer(&layer(&[(".wh.usr", F, 0o644, 0, 0, "")])[..])
+            .unwrap();
+        let (fixups, _) = u.finish(b"agent").unwrap();
+        let paths: Vec<_> = fixups.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["/usr0"]);
+    }
+
+    #[test]
+    fn deep_long_names_are_refused_not_recursed() {
+        let deep = format!("{}f", "a/".repeat(20_000));
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::GNULongName);
+        h.set_path("././@LongLink").unwrap();
+        h.set_size(deep.len() as u64 + 1);
+        h.set_cksum();
+        let mut b = tar::Builder::new(Vec::new());
+        let mut name = deep.into_bytes();
+        name.push(0);
+        b.append(&h, &name[..]).unwrap();
+        let mut f = tar::Header::new_gnu();
+        f.set_entry_type(F);
+        f.set_path("placeholder").unwrap();
+        f.set_size(0);
+        f.set_cksum();
+        b.append(&f, &b""[..]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut u = Unpack::new(dir.path(), 1 << 20, Default::default()).unwrap();
         assert!(u.layer(&b.into_inner().unwrap()[..]).is_err());
     }
 }

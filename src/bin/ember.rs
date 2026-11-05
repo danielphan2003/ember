@@ -135,15 +135,19 @@ async fn serve(cfg: Config) -> Result<()> {
     preflight(&cfg)?;
     let server = Server::new(cfg.clone(), AGENT)?;
     server.clean_stale();
-    let images = server.images().clone();
     let keep = cfg.image_keep;
+    let janitor = server.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(3600));
         loop {
             tick.tick().await;
-            let removed = images.prune(keep);
+            let removed = janitor.images().prune(keep);
             if !removed.is_empty() {
                 tracing::info!(count = removed.len(), "pruned images");
+            }
+            let dirs = janitor.prune_vm_dirs();
+            if dirs > 0 {
+                tracing::info!(count = dirs, "removed orphaned VM directories");
             }
         }
     });

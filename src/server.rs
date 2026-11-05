@@ -100,6 +100,8 @@ struct State {
     /// Set by destroy: a Start that looked the environment up just before
     /// must not boot a VM nothing can reach.
     removed: bool,
+    /// A boot in progress on a blocking thread.
+    booting: Option<tokio::task::JoinHandle<anyhow::Result<Machine>>>,
     slot: Option<(Slot, OwnedSemaphorePermit)>,
     reserved_mib: u32,
     machine: Option<Machine>,
@@ -164,6 +166,22 @@ impl Server {
         let _ = std::fs::remove_dir_all(self.0.cfg.state_dir.join("vms"));
     }
 
+    /// Removes VM directories that belong to no environment, such as one a
+    /// cancelled boot recreated after teardown. Environments are registered
+    /// before their directory exists, so this never races a live one.
+    pub fn prune_vm_dirs(&self) -> usize {
+        let Ok(entries) = std::fs::read_dir(self.0.cfg.state_dir.join("vms")) else {
+            return 0;
+        };
+        let live: std::collections::HashSet<String> =
+            self.0.envs.lock().unwrap().keys().cloned().collect();
+        entries
+            .flatten()
+            .filter(|e| !live.contains(&*e.file_name().to_string_lossy()))
+            .filter(|e| std::fs::remove_dir_all(e.path()).is_ok())
+            .count()
+    }
+
     fn snapshot(&self) -> Vec<Arc<Environment>> {
         self.0.envs.lock().unwrap().values().cloned().collect()
     }
@@ -196,6 +214,11 @@ impl Server {
     /// Stops the VM and returns its slot, memory and disk, but keeps the
     /// environment known so the runner's Remove still succeeds.
     async fn teardown(&self, st: &mut State, id: &str) {
+        if let Some(boot) = st.booting.take()
+            && let Ok(Ok(m)) = boot.await
+        {
+            m.destroy().await;
+        }
         if let Some(m) = st.machine.take() {
             m.destroy().await;
         }
@@ -338,13 +361,18 @@ impl Server {
         // Cloning (or copying, without reflinks) and resize2fs are disk work:
         // keep them off the async workers.
         let rt = tokio::runtime::Handle::current();
-        let machine = tokio::task::spawn_blocking(move || {
+        // The handle lives in the state, so a Start cancelled mid-boot leaves
+        // it for teardown to wait on: the VM must be gone before its tap and
+        // slot are handed to another job.
+        let boot = st.booting.insert(tokio::task::spawn_blocking(move || {
             let _guard = rt.enter(); // boot spawns tasks for the console and exit
             vm::boot(&spec)
-        })
-        .await
-        .map_err(|err| Status::internal(format!("boot: {err}")))?
-        .map_err(|err| Status::internal(format!("boot: {err:#}")))?;
+        }));
+        let booted = boot.await;
+        st.booting = None;
+        let machine = booted
+            .map_err(|err| Status::internal(format!("boot: {err}")))?
+            .map_err(|err| Status::internal(format!("boot: {err:#}")))?;
         *e.killer.lock().unwrap() = Some(machine.killer());
         let machine = st.machine.insert(machine);
         if let Err(err) = machine.wait_agent(Duration::from_secs(60)).await {
