@@ -261,3 +261,30 @@ fn host_lan_addr() -> Option<Ipv4Addr> {
         .filter_map(|w| w.split('/').next()?.parse::<Ipv4Addr>().ok())
         .find(|ip| ip.is_private() && ip.octets()[0] != 172)
 }
+
+/// debugfs once deadlocked on large fixup scripts (its echo filled a pipe).
+/// Needs only e2fsprogs, but runs with the e2e tests because the unit tests
+/// run in a container without it.
+#[test]
+fn e2e_many_fixups() {
+    if std::env::var("EMBER_E2E_CONFIG").map_or(true, |v| v.is_empty()) {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let tree = tmp.path().join("tree");
+    std::fs::create_dir(&tree).unwrap();
+    let mut fixups = vec![];
+    for i in 0..3000 {
+        std::fs::write(tree.join(format!("f{i}")), "x").unwrap();
+        fixups.push(ember::image::Fixup {
+            path: format!("/f{i}"),
+            uid: 1000,
+            gid: 1000,
+            mode: libc::S_IFREG | 0o640,
+        });
+    }
+    let out = tmp.path().join("rootfs.ext4");
+    let t0 = Instant::now();
+    ember::image::build_ext4(&tree, &out, 256 << 20, &fixups, &Default::default()).unwrap();
+    eprintln!("3000 fixups applied in {} ms", t0.elapsed().as_millis());
+}

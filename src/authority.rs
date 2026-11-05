@@ -23,6 +23,7 @@ const END_HEADERS: u8 = 0x4;
 const PADDED: u8 = 0x8;
 const PRIORITY: u8 = 0x20;
 const MAX_FRAME: usize = 16384; // the HTTP/2 default; h2 never lowers it
+const MAX_BLOCK: usize = 256 << 10; // far above any gRPC request's headers
 // The re-encoded blocks use hpack's default 4096-byte dynamic table, which
 // is h2's default decoder size too; h2 does not shrink it, so the two stay
 // in sync. The client's own table size only affects our decoder, which
@@ -114,6 +115,9 @@ pub async fn rewrite(
                 return Err(bad("expected CONTINUATION"));
             }
             block.extend_from_slice(&p);
+            if block.len() > MAX_BLOCK {
+                return Err(bad("header block too large"));
+            }
             end = f & END_HEADERS != 0;
         }
         let mut headers = decoder

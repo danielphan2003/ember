@@ -97,6 +97,9 @@ struct Environment {
 
 #[derive(Default)]
 struct State {
+    /// Set by destroy: a Start that looked the environment up just before
+    /// must not boot a VM nothing can reach.
+    removed: bool,
     slot: Option<(Slot, OwnedSemaphorePermit)>,
     reserved_mib: u32,
     machine: Option<Machine>,
@@ -210,6 +213,7 @@ impl Server {
     async fn destroy(&self, e: &Arc<Environment>) {
         e.kill();
         let mut st = e.state.lock().await;
+        st.removed = true;
         self.teardown(&mut st, &e.id).await;
         *e.killer.lock().unwrap() = None;
         if let Some(h) = e.lifetime.lock().unwrap().take() {
@@ -472,6 +476,15 @@ impl pb::backend_plugin_server::BackendPlugin for Server {
         tokio::spawn(async move {
             let log = StartLog { tx: tx.clone() };
             let mut st = e.state.clone().lock_owned().await;
+            if st.removed {
+                let _ = tx
+                    .send(Err(Status::not_found(format!(
+                        "environment {:?} was removed",
+                        e.id
+                    ))))
+                    .await;
+                return;
+            }
             if st.machine.is_some() {
                 let _ = tx
                     .send(Err(Status::failed_precondition(

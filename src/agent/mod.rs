@@ -35,6 +35,7 @@ const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/s
 /// background process the step started (`server &`) may keep the pipes
 /// open for ever; its later output is read and dropped.
 const DRAIN: Duration = Duration::from_millis(200);
+const DRAIN_MAX: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
 pub struct Agent;
@@ -72,6 +73,7 @@ impl pb::backend_plugin_server::BackendPlugin for Agent {
             let watcher = tx.clone();
             let out = Arc::new(ExecSink {
                 tx: Mutex::new(Some(tx)),
+                last: std::sync::Mutex::new(std::time::Instant::now()),
             });
             if let Err(msg) = run(req, out.clone(), watcher).await {
                 out.finish(exec_output::Output::ExecFailed(pb::ExecFailed {
@@ -101,6 +103,7 @@ impl pb::backend_plugin_server::BackendPlugin for Agent {
             tarfs::untar(tarfs::ChanReader::new(rx), Path::new(&dest))
         });
         let mut pending = Some(first.data);
+        let mut tx = Some(tx);
         loop {
             let data = match pending.take() {
                 Some(d) => d,
@@ -114,8 +117,13 @@ impl pb::backend_plugin_server::BackendPlugin for Agent {
                     None => break,
                 },
             };
-            if !data.is_empty() && tx.send(data).await.is_err() {
-                break; // untar stopped early; its error is reported below
+            // Once untar has finished (or failed), keep reading so the
+            // client can close its side; the result is reported below.
+            if let Some(t) = &tx
+                && !data.is_empty()
+                && t.send(data).await.is_err()
+            {
+                tx = None;
             }
         }
         drop(tx);
@@ -151,10 +159,16 @@ impl pb::backend_plugin_server::BackendPlugin for Agent {
 /// so the stream ends even while a background process keeps a pump alive.
 struct ExecSink {
     tx: Mutex<Option<ExecTx>>,
+    last: std::sync::Mutex<std::time::Instant>,
 }
 
 impl ExecSink {
+    fn idle(&self) -> Duration {
+        self.last.lock().unwrap().elapsed()
+    }
+
     async fn data(&self, stream: data_chunk::Stream, data: Vec<u8>) {
+        *self.last.lock().unwrap() = std::time::Instant::now();
         if let Some(tx) = self.tx.lock().await.as_ref() {
             let chunk = DataChunk {
                 stream: stream as i32,
@@ -244,7 +258,17 @@ async fn run(req: ExecRequest, out: Arc<ExecSink>, watcher: ExecTx) -> Result<()
         }
     };
 
-    let _ = tokio::time::timeout(DRAIN, futures_util::future::join_all(pumps)).await;
+    // Forward output while it keeps coming (a step's last lines may still be
+    // in the pipe), but stop once it has been idle for DRAIN, or after
+    // DRAIN_MAX in total, so a chatty background process cannot hold the
+    // step open.
+    let mut pumps = std::pin::pin!(futures_util::future::join_all(pumps));
+    let cap = tokio::time::Instant::now() + DRAIN_MAX;
+    while tokio::time::timeout(DRAIN, pumps.as_mut()).await.is_err() {
+        if out.idle() >= DRAIN || tokio::time::Instant::now() >= cap {
+            break;
+        }
+    }
 
     use std::os::unix::process::ExitStatusExt;
     let code = status

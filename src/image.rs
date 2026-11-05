@@ -8,14 +8,17 @@
 //! cannot. Each VM boots from a copy-on-write clone of the result.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     ffi::CString,
     fs::{self, File, Permissions},
     io::{self, Read, Seek, Write},
     os::unix::{fs::PermissionsExt, process::CommandExt},
     path::{Path, PathBuf},
     process::Command,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime},
 };
 
@@ -152,16 +155,19 @@ impl Store {
                     let store = self.clone();
                     let (r, name) = (r.clone(), name.clone());
                     let task = tokio::spawn(async move {
-                        let res = tokio::time::timeout(
+                        // Forget this pull however the task ends, panics included.
+                        let _forget = Forget(store.clone(), name);
+                        // Dropping the pull on timeout sets the flag, which stops
+                        // the unpack and kills mke2fs or debugfs.
+                        let cancel = Cancel::default();
+                        tokio::time::timeout(
                             Duration::from_secs(1800),
-                            store.refresh_or_pull(&r, progress),
+                            store.refresh_or_pull(&r, progress, cancel.flag()),
                         )
                         .await
                         .unwrap_or_else(|_| {
                             Err(anyhow!("pulling {} took over 30 minutes", r.name()))
-                        });
-                        store.pulls.lock().unwrap().remove(&name);
-                        res
+                        })
                     });
                     async move {
                         task.await
@@ -187,7 +193,12 @@ impl Store {
         }
     }
 
-    async fn refresh_or_pull(self: &Arc<Self>, r: &Reference, progress: Progress) -> Result<Image> {
+    async fn refresh_or_pull(
+        self: &Arc<Self>,
+        r: &Reference,
+        progress: Progress,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Image> {
         let name = r.name();
         if let Some(e) = self.load_refs().get(&name).cloned()
             && let Ok(head) = self.client.head(r).await
@@ -203,10 +214,15 @@ impl Store {
             );
             return Ok(img);
         }
-        self.pull(r, progress).await
+        self.pull(r, progress, cancel).await
     }
 
-    async fn pull(self: &Arc<Self>, r: &Reference, progress: Progress) -> Result<Image> {
+    async fn pull(
+        self: &Arc<Self>,
+        r: &Reference,
+        progress: Progress,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Image> {
         let resolved = self
             .client
             .resolve(r)
@@ -230,7 +246,7 @@ impl Store {
         let tree = tmp.path().join("tree");
         fs::create_dir(&tree)?;
 
-        let mut unpack = Unpack::new(&tree, self.max_bytes)?;
+        let mut unpack = Unpack::new(&tree, self.max_bytes, cancel.clone())?;
         // Compressed layers count against the same budget as the unpacked
         // image, so a hostile image cannot fill the disk with downloads.
         let mut downloaded = 0u64;
@@ -261,7 +277,7 @@ impl Store {
         let fs_bytes = self.min_bytes.max(size + size / 2 + (512 << 20));
         let ext4 = tmp.path().join("rootfs.ext4");
         let (tree2, ext42) = (tree.clone(), ext4.clone());
-        tokio::task::spawn_blocking(move || build_ext4(&tree2, &ext42, fs_bytes, &fixups))
+        tokio::task::spawn_blocking(move || build_ext4(&tree2, &ext42, fs_bytes, &fixups, &cancel))
             .await??;
         fs::remove_dir_all(&tree).context("remove unpacked tree")?;
 
@@ -325,6 +341,31 @@ impl Store {
     }
 }
 
+/// Removes a pull from the in-flight table when dropped.
+struct Forget(Arc<Store>, String);
+
+impl Drop for Forget {
+    fn drop(&mut self) {
+        self.0.pulls.lock().unwrap().remove(&self.1);
+    }
+}
+
+/// Sets its flag when dropped, so blocking work for an abandoned pull stops.
+#[derive(Default)]
+struct Cancel(Arc<AtomicBool>);
+
+impl Cancel {
+    fn flag(&self) -> Arc<AtomicBool> {
+        self.0.clone()
+    }
+}
+
+impl Drop for Cancel {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 fn decompress(d: &Descriptor, f: File) -> Result<Box<dyn Read + Send>> {
     let t = d.media_type.as_str();
     Ok(if t.ends_with("gzip") || t.ends_with("+gzip") {
@@ -359,38 +400,107 @@ pub struct Fixup {
 /// skipped (the guest mounts devtmpfs), and so are extended attributes.
 pub struct Unpack {
     root: Dir,
-    fixups: HashMap<PathBuf, Fixup>,
+    fixups: BTreeMap<PathBuf, Fixup>,
     size: u64,
     limit: u64,
+    cancel: Arc<AtomicBool>,
 }
 
+/// Largest GNU long name or PAX header accepted. The tar crate would read
+/// any size into memory; these are a few hundred bytes in real images.
+const MAX_META: u64 = 1 << 20;
+
 impl Unpack {
-    pub fn new(tree: &Path, limit: u64) -> Result<Self> {
+    pub fn new(tree: &Path, limit: u64, cancel: Arc<AtomicBool>) -> Result<Self> {
         Ok(Self {
             root: Dir::open_ambient_dir(tree, ambient_authority())?,
-            fixups: HashMap::new(),
+            fixups: BTreeMap::new(),
             size: 0,
             limit,
+            cancel,
         })
     }
 
     fn remove(&mut self, p: &Path) {
+        if self.root.symlink_metadata(p).is_err() {
+            return; // nothing there, so no fixups under it either
+        }
         if self.root.remove_dir_all(p).is_err() {
             let _ = self.root.remove_file(p);
         }
-        self.fixups.retain(|k, _| !k.starts_with(p));
+        // Fixups at or below p sort together, from p onwards.
+        let doomed: Vec<PathBuf> = self
+            .fixups
+            .range(p.to_path_buf()..)
+            .map(|(k, _)| k)
+            .take_while(|k| k.starts_with(p))
+            .cloned()
+            .collect();
+        for k in doomed {
+            self.fixups.remove(&k);
+        }
     }
 
+    /// Applies one layer. GNU long names and PAX headers are handled here,
+    /// with a size cap, rather than by the tar crate.
     pub fn layer(&mut self, r: impl Read) -> Result<()> {
         let mut ar = tar::Archive::new(r);
         let mut added: HashSet<PathBuf> = HashSet::new();
-        for entry in ar.entries()? {
+        let (mut long_name, mut long_link): (Option<PathBuf>, Option<PathBuf>) = (None, None);
+        let mut pax_size: Option<u64> = None;
+        for entry in ar.entries()?.raw(true) {
+            if self.cancel.load(Ordering::Relaxed) {
+                bail!("cancelled");
+            }
             let mut e = entry?;
-            let shown = e
-                .path()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default();
-            self.entry(&mut e, &mut added)
+            let kind = e.header().entry_type();
+            if kind.is_gnu_longname()
+                || kind.is_gnu_longlink()
+                || kind.is_pax_local_extensions()
+                || kind.is_pax_global_extensions()
+            {
+                if e.header().size()? > MAX_META {
+                    bail!("tar metadata entry over {MAX_META} bytes");
+                }
+                let mut buf = Vec::new();
+                (&mut e).take(MAX_META).read_to_end(&mut buf)?;
+                let text = |b: &[u8]| {
+                    use std::os::unix::ffi::OsStrExt;
+                    let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+                    PathBuf::from(std::ffi::OsStr::from_bytes(&b[..end]))
+                };
+                if kind.is_gnu_longname() {
+                    long_name = Some(text(&buf));
+                } else if kind.is_gnu_longlink() {
+                    long_link = Some(text(&buf));
+                } else if kind.is_pax_local_extensions() {
+                    for ext in tar::PaxExtensions::new(&buf) {
+                        let ext = ext?;
+                        match ext.key() {
+                            Ok("path") => long_name = Some(text(ext.value_bytes())),
+                            Ok("linkpath") => long_link = Some(text(ext.value_bytes())),
+                            Ok("size") => pax_size = ext.value().ok().and_then(|v| v.parse().ok()),
+                            _ => {}
+                        }
+                    }
+                }
+                continue;
+            }
+            if let Some(size) = pax_size.take()
+                && size != e.header().size()?
+            {
+                bail!("PAX size {size} disagrees with the tar header");
+            }
+            let path = match long_name.take() {
+                Some(p) => p,
+                None => e.path()?.into_owned(),
+            };
+            let link = match long_link.take() {
+                Some(p) => Some(p),
+                None => e.link_name()?.map(|l| l.into_owned()),
+            };
+            let shown = path.display().to_string();
+            self.entry(&mut e, &path, link, &mut added)
                 .with_context(|| format!("unpack {shown}"))?;
         }
         Ok(())
@@ -399,11 +509,13 @@ impl Unpack {
     fn entry<R: Read>(
         &mut self,
         e: &mut tar::Entry<R>,
+        raw_path: &Path,
+        link: Option<PathBuf>,
         added: &mut HashSet<PathBuf>,
     ) -> Result<()> {
         {
             let h = e.header().clone();
-            let path = clean(&e.path()?);
+            let path = clean(raw_path);
             let Some(base) = path.file_name().map(|b| b.to_string_lossy().into_owned()) else {
                 return Ok(());
             };
@@ -437,58 +549,56 @@ impl Unpack {
                 self.root.create_dir_all(&parent)?;
             }
             let perm = h.mode().unwrap_or(0o644) & 0o7777;
-            let (ftype, written) = match h.entry_type() {
-                tar::EntryType::Directory => {
-                    if self.root.symlink_metadata(&path).is_ok_and(|m| !m.is_dir()) {
+            let (ftype, written) =
+                match h.entry_type() {
+                    tar::EntryType::Directory => {
+                        if self.root.symlink_metadata(&path).is_ok_and(|m| !m.is_dir()) {
+                            self.remove(&path);
+                        }
+                        self.root.create_dir_all(&path)?;
+                        self.root.set_permissions(&path, perms(0o755))?;
+                        (libc::S_IFDIR, 0o755)
+                    }
+                    tar::EntryType::Regular | tar::EntryType::Continuous => {
                         self.remove(&path);
+                        let mut f = self.root.create(&path)?;
+                        let budget = self.limit.saturating_sub(self.size) + 1;
+                        let n = io::copy(&mut e.take(budget), &mut f)?;
+                        self.size += n;
+                        if self.size > self.limit {
+                            bail!(
+                                "image is larger than the {} MiB limit (max_image_mib)",
+                                self.limit >> 20
+                            );
+                        }
+                        let written = perm & 0o777 | 0o600;
+                        f.set_permissions(perms(written))?;
+                        // A hostile header may carry any 64-bit time: skip what
+                        // does not fit rather than overflow.
+                        if let Some(t) = h.mtime().ok().and_then(|m| {
+                            SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(m))
+                        }) {
+                            let _ = f.into_std().set_modified(t);
+                        }
+                        (libc::S_IFREG, written)
                     }
-                    self.root.create_dir_all(&path)?;
-                    self.root.set_permissions(&path, perms(0o755))?;
-                    (libc::S_IFDIR, 0o755)
-                }
-                tar::EntryType::Regular | tar::EntryType::Continuous => {
-                    self.remove(&path);
-                    let mut f = self.root.create(&path)?;
-                    let budget = self.limit.saturating_sub(self.size) + 1;
-                    let n = io::copy(&mut e.take(budget), &mut f)?;
-                    self.size += n;
-                    if self.size > self.limit {
-                        bail!(
-                            "image is larger than the {} MiB limit (max_image_mib)",
-                            self.limit >> 20
-                        );
+                    tar::EntryType::Symlink => {
+                        self.remove(&path);
+                        let target = link.ok_or_else(|| anyhow!("symlink without target"))?;
+                        self.root.symlink_contents(target, &path)?;
+                        (libc::S_IFLNK, 0o777)
                     }
-                    let written = perm & 0o777 | 0o600;
-                    f.set_permissions(perms(written))?;
-                    if let Ok(mtime) = h.mtime() {
-                        let _ = f
-                            .into_std()
-                            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(mtime));
+                    tar::EntryType::Link => {
+                        let src = clean(&link.ok_or_else(|| anyhow!("hardlink without target"))?);
+                        self.remove(&path);
+                        self.root
+                            .hard_link(&src, &self.root, &path)
+                            .with_context(|| format!("hardlink {}", path.display()))?;
+                        added.insert(path);
+                        return Ok(()); // shares the inode, and its fixup, with src
                     }
-                    (libc::S_IFREG, written)
-                }
-                tar::EntryType::Symlink => {
-                    self.remove(&path);
-                    let target = e
-                        .link_name()?
-                        .ok_or_else(|| anyhow!("symlink without target"))?;
-                    self.root.symlink_contents(target, &path)?;
-                    (libc::S_IFLNK, 0o777)
-                }
-                tar::EntryType::Link => {
-                    let src = clean(
-                        &e.link_name()?
-                            .ok_or_else(|| anyhow!("hardlink without target"))?,
-                    );
-                    self.remove(&path);
-                    self.root
-                        .hard_link(&src, &self.root, &path)
-                        .with_context(|| format!("hardlink {}", path.display()))?;
-                    added.insert(path);
-                    return Ok(()); // shares the inode, and its fixup, with src
-                }
-                _ => return Ok(()),
-            };
+                    _ => return Ok(()),
+                };
             self.size += 512;
             let perm = if ftype == libc::S_IFLNK { 0o777 } else { perm };
             let (uid, gid) = (h.uid().unwrap_or(0), h.gid().unwrap_or(0));
@@ -534,7 +644,13 @@ fn perms(mode: u32) -> cap_std::fs::Permissions {
 
 /// Makes an ext4 image of the given size from dir, then applies fixups. It
 /// needs only e2fsprogs (1.47.1 or newer) and unprivileged user namespaces.
-pub fn build_ext4(dir: &Path, out: &Path, size: u64, fixups: &[Fixup]) -> Result<()> {
+pub fn build_ext4(
+    dir: &Path,
+    out: &Path,
+    size: u64,
+    fixups: &[Fixup],
+    cancel: &AtomicBool,
+) -> Result<()> {
     let mut cmd = Command::new("mke2fs");
     cmd.args([
         "-q",
@@ -589,13 +705,9 @@ pub fn build_ext4(dir: &Path, out: &Path, size: u64, fixups: &[Fixup]) -> Result
             Ok(())
         });
     }
-    let o = cmd.output().context("run mke2fs")?;
-    if !o.status.success() {
-        bail!(
-            "mke2fs: {}: {}",
-            o.status,
-            String::from_utf8_lossy(&o.stderr).trim()
-        );
+    let (status, stderr) = run_cancellable(&mut cmd, out, cancel).context("run mke2fs")?;
+    if !status.success() {
+        bail!("mke2fs: {status}: {}", stderr.trim());
     }
     if fixups.is_empty() {
         return Ok(());
@@ -614,30 +726,56 @@ pub fn build_ext4(dir: &Path, out: &Path, size: u64, fixups: &[Fixup]) -> Result
         }
         script += &format!("sif {q} mode 0{:o}\n", f.mode);
     }
-    let mut child = Command::new("debugfs")
-        .args(["-w", "-f", "-"])
-        .arg(out)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .context("run debugfs")?;
-    child
-        .stdin
-        .take()
-        .expect("piped")
-        .write_all(script.as_bytes())?;
-    let o = child.wait_with_output()?;
-    let text = String::from_utf8_lossy(&o.stdout) + String::from_utf8_lossy(&o.stderr);
-    // debugfs reports per-command failures but exits 0.
-    if !o.status.success()
-        || text
-            .lines()
-            .any(|l| l.contains("File not found") || l.contains("invalid"))
-    {
-        bail!("debugfs: {}", text.trim());
+    // The script goes in a file and debugfs's echo of each command to
+    // /dev/null: piping both ways deadlocks once the echo fills the pipe.
+    let script_path = out.with_extension("debugfs");
+    fs::write(&script_path, script)?;
+    let mut cmd = Command::new("debugfs");
+    cmd.arg("-w").arg("-f").arg(&script_path).arg(out);
+    let res = run_cancellable(&mut cmd, out, cancel).context("run debugfs");
+    let _ = fs::remove_file(&script_path);
+    let (status, stderr) = res?;
+    // debugfs exits 0 even when a command fails; failures go to stderr,
+    // after its version banner.
+    let errors: Vec<&str> = stderr
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with("debugfs "))
+        .collect();
+    if !status.success() || !errors.is_empty() {
+        bail!("debugfs: {status}: {}", errors.join("; "));
     }
     Ok(())
+}
+
+/// Runs cmd with stdout discarded and stderr kept in a file next to `near`,
+/// killing it if `cancel` is set.
+fn run_cancellable(
+    cmd: &mut Command,
+    near: &Path,
+    cancel: &AtomicBool,
+) -> Result<(std::process::ExitStatus, String)> {
+    let err_path = near.with_extension("stderr");
+    let err_file = File::create(&err_path)?;
+    let mut child = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(err_file)
+        .spawn()?;
+    let status = loop {
+        if let Some(s) = child.try_wait()? {
+            break s;
+        }
+        if cancel.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_file(&err_path);
+            bail!("cancelled");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let stderr = fs::read_to_string(&err_path).unwrap_or_default();
+    let _ = fs::remove_file(&err_path);
+    Ok((status, stderr))
 }
 
 #[cfg(test)]
@@ -673,7 +811,7 @@ mod tests {
     #[test]
     fn fixups_and_whiteouts() {
         let dir = tempfile::tempdir().unwrap();
-        let mut u = Unpack::new(dir.path(), 1 << 20).unwrap();
+        let mut u = Unpack::new(dir.path(), 1 << 20, Default::default()).unwrap();
         u.layer(
             &layer(&[
                 ("etc/", D, 0o755, 0, 0, ""),
@@ -737,7 +875,7 @@ mod tests {
     fn cannot_escape_through_symlink() {
         let outside = tempfile::tempdir().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let mut u = Unpack::new(dir.path(), 1 << 20).unwrap();
+        let mut u = Unpack::new(dir.path(), 1 << 20, Default::default()).unwrap();
         let res = u.layer(
             &layer(&[
                 ("evil", S, 0o777, 0, 0, outside.path().to_str().unwrap()),
@@ -754,10 +892,46 @@ mod tests {
     #[test]
     fn size_limit() {
         let dir = tempfile::tempdir().unwrap();
-        let mut u = Unpack::new(dir.path(), 3).unwrap();
+        let mut u = Unpack::new(dir.path(), 3, Default::default()).unwrap();
         assert!(
             u.layer(&layer(&[("a", F, 0o644, 0, 0, ""), ("b", F, 0o644, 0, 0, "")])[..])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn hostile_tar_headers() {
+        // A binary-encoded mtime of 2^64-1 must not overflow.
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(F);
+        h.set_mode(0o644);
+        h.set_size(2);
+        h.set_path("f").unwrap();
+        let m = &mut h.as_gnu_mut().unwrap().mtime;
+        m[0] = 0x80;
+        m[4..].copy_from_slice(&u64::MAX.to_be_bytes());
+        h.set_cksum();
+        let mut b = tar::Builder::new(Vec::new());
+        b.append(&h, &b"hi"[..]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut u = Unpack::new(dir.path(), 1 << 20, Default::default()).unwrap();
+        u.layer(&b.into_inner().unwrap()[..]).unwrap();
+
+        // A long name of normal size works; a 2 MiB one is refused.
+        let long = format!("d/{}file", "abcdefghij/".repeat(20));
+        let ok = layer(&[(&long, F, 0o644, 0, 0, "")]);
+        let mut u = Unpack::new(dir.path(), 1 << 20, Default::default()).unwrap();
+        u.layer(&ok[..]).unwrap();
+        assert!(dir.path().join(&long).exists());
+
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::GNULongName);
+        h.set_path("././@LongLink").unwrap();
+        h.set_size(2 << 20);
+        h.set_cksum();
+        let mut b = tar::Builder::new(Vec::new());
+        b.append(&h, &vec![b'a'; 2 << 20][..]).unwrap();
+        let mut u = Unpack::new(dir.path(), 1 << 30, Default::default()).unwrap();
+        assert!(u.layer(&b.into_inner().unwrap()[..]).is_err());
     }
 }

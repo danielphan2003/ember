@@ -19,7 +19,6 @@ path = "src/bin/ember-agent.rs"
 lto = "thin"
 codegen-units = 4
 strip = true
-panic = "abort"
 
 [dependencies]
 anyhow = "1.0.104"

@@ -185,6 +185,7 @@ impl Client {
                 }
             }))
             .connect_timeout(Duration::from_secs(30))
+            .read_timeout(Duration::from_secs(60))
             .build()?;
         Ok(Self {
             http,
@@ -252,7 +253,8 @@ impl Client {
             access_token: Option<String>,
         }
         let resp = self.http.get(url).send().await?.error_for_status()?;
-        let t: Token = resp.json().await?;
+        let t: Token =
+            serde_json::from_slice(&read_capped(resp, 64 << 10).await?).context("token")?;
         t.token
             .or(t.access_token)
             .ok_or_else(|| anyhow!("token endpoint returned no token"))
@@ -298,10 +300,7 @@ impl Client {
         if !status.is_success() {
             bail!("{}: manifest {reference}: {status}", r.name());
         }
-        let body = resp.bytes().await?;
-        if body.len() > 4 << 20 {
-            bail!("manifest too large");
-        }
+        let body = read_capped(resp, 4 << 20).await?;
         let digest = format!("sha256:{}", hex::encode(Sha256::digest(&body)));
         if reference.starts_with("sha256:") && digest != reference {
             bail!("manifest digest mismatch: got {digest}, want {reference}");
@@ -387,6 +386,21 @@ impl Client {
         }
         Ok(())
     }
+}
+
+/// Reads a response body, refusing more than limit bytes: a hostile
+/// registry must not make ember buffer gigabytes.
+async fn read_capped(resp: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut body = resp.bytes_stream();
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk?;
+        if out.len() + chunk.len() > limit {
+            bail!("registry response over {limit} bytes");
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
 }
 
 fn parse_challenge(h: &str) -> HashMap<String, String> {
