@@ -37,7 +37,10 @@ Forgejo ◀──── forgejo-runner ──gRPC (plugin.v1alpha)──▶ embe
   per slot, owned by the `ember` user, and one nftables table. Guests get
   IPv4 to the internet through NAT. They cannot reach the host, each other,
   private or CGNAT (tailnet) ranges, link-local addresses such as cloud
-  metadata, or IPv6, and they cannot spoof another slot's address. The
+  metadata, or IPv6, and they cannot spoof another slot's address. Only
+  TCP, UDP and ICMP leave (so no 6in4 or GRE tunnels), each guest may hold
+  4096 tracked connections, and outbound SMTP is dropped. A public NAT64
+  service would still give a guest IPv6 reach; no rule can tell it apart. The
   end-to-end test checks each of these from inside a VM.
 - **Privileges.** `ember serve` and every Firecracker process run as the
   unprivileged `ember` user under a systemd sandbox that may only reach
@@ -146,8 +149,8 @@ and ember keeps serving the others.
 - Guests have no inbound connections and cannot send mail (port 25).
 - The runner's cache server is unreachable from guests, so `actions/cache`
   misses. Large dependencies are better baked into the job image.
-- Images come from public registries; credentials for private ones are not
-  supported yet.
+- Images are pulled anonymously, on purpose: image references come from
+  jobs, so a credential would let every job read what it can read.
 - x86_64 only (Firecracker supports aarch64; ember has not been tried there).
 - File capabilities and other extended attributes in images are dropped.
 - The plugin protocol is alpha upstream and may change between runner

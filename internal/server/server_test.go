@@ -78,3 +78,24 @@ func TestRemoveBeforeStart(t *testing.T) {
 		t.Fatalf("slot leaked: %d free of %d", len(s.slots), s.cfg.Slots)
 	}
 }
+
+func TestMergeImageEnv(t *testing.T) {
+	got := mergeImageEnv(
+		[]string{"PATH=/usr/local/go/bin:/usr/bin:/bin", "GOLANG_VERSION=1.26", "LANG=C.UTF-8"},
+		map[string]string{"PATH": "/root/.local/bin:/usr/bin", "LANG": "en_US.UTF-8", "CI": "true"},
+	)
+	want := map[string]string{
+		"PATH":           "/root/.local/bin:/usr/bin:/usr/local/go/bin:/bin",
+		"GOLANG_VERSION": "1.26",
+		"LANG":           "en_US.UTF-8",
+		"CI":             "true",
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("%s = %q, want %q", k, got[k], v)
+		}
+	}
+	if got := mergeImageEnv([]string{"PATH=/opt/bin"}, map[string]string{}); got["PATH"] != "/opt/bin" {
+		t.Errorf("image PATH dropped when the step sets none: %q", got["PATH"])
+	}
+}

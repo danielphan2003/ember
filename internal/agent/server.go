@@ -305,9 +305,17 @@ func (r *chunkReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// Untar extracts a tar stream under dest, refusing entries that would land
-// outside it.
+// Untar extracts a tar stream under dest. Writes go through os.Root, so
+// neither "../" names nor symlinks can place a file outside dest.
 func Untar(r io.Reader, dest string) error {
+	root, err := os.OpenRoot(dest)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	rel := func(name string) string {
+		return strings.TrimPrefix(filepath.Clean("/"+name), "/")
+	}
 	tr := tar.NewReader(r)
 	for {
 		hdr, err := tr.Next()
@@ -317,22 +325,22 @@ func Untar(r io.Reader, dest string) error {
 		if err != nil {
 			return err
 		}
-		target, err := within(dest, hdr.Name)
-		if err != nil {
-			return err
+		target := rel(hdr.Name)
+		if target == "" {
+			continue
 		}
 		mode := fs.FileMode(hdr.Mode) & fs.ModePerm
 		switch hdr.Typeflag {
 		case tar.TypeDir:
-			if err := os.MkdirAll(target, mode|0o700); err != nil {
+			if err := root.MkdirAll(target, mode|0o700); err != nil {
 				return err
 			}
 		case tar.TypeReg:
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			if err := root.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return err
 			}
-			_ = os.Remove(target)
-			f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+			_ = root.Remove(target)
+			f, err := root.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
 			if err != nil {
 				return err
 			}
@@ -344,53 +352,49 @@ func Untar(r io.Reader, dest string) error {
 				return err
 			}
 			// Respect the mode exactly (umask would otherwise strip bits).
-			if err := os.Chmod(target, mode); err != nil {
+			if err := root.Chmod(target, mode); err != nil {
 				return err
 			}
 		case tar.TypeSymlink:
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			if err := root.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return err
 			}
-			_ = os.Remove(target)
-			if err := os.Symlink(hdr.Linkname, target); err != nil {
+			_ = root.Remove(target)
+			if err := root.Symlink(hdr.Linkname, target); err != nil {
 				return err
 			}
 			continue
 		case tar.TypeLink:
-			src, err := within(dest, hdr.Linkname)
-			if err != nil {
-				return err
-			}
-			_ = os.Remove(target)
-			if err := os.Link(src, target); err != nil {
+			_ = root.Remove(target)
+			if err := root.Link(rel(hdr.Linkname), target); err != nil {
 				return err
 			}
 		default:
 			continue
 		}
 		if hdr.Uid != 0 || hdr.Gid != 0 {
-			_ = os.Lchown(target, hdr.Uid, hdr.Gid)
+			_ = root.Lchown(target, hdr.Uid, hdr.Gid)
 		}
 	}
 }
 
-func within(dest, name string) (string, error) {
-	clean := filepath.Clean("/" + name)
-	target := filepath.Join(dest, clean)
-	if target != filepath.Clean(dest) && !strings.HasPrefix(target, filepath.Clean(dest)+"/") {
-		return "", status.Errorf(codes.InvalidArgument, "tar entry %q escapes %s", name, dest)
-	}
-	return target, nil
-}
-
 func (s *Server) CopyOut(req *pb.CopyOutRequest, stream grpc.ServerStreamingServer[pb.CopyOutChunk]) error {
 	src := req.GetSrcPath()
-	fi, err := os.Lstat(src)
-	if err != nil {
-		return status.Errorf(codes.NotFound, "copyout: %v", err)
-	}
 	w := &copyOutWriter{stream: stream}
 	tw := tar.NewWriter(w)
+	fi, err := os.Lstat(src)
+	if errors.Is(err, fs.ErrNotExist) {
+		// An empty archive, as the runner expects for a missing file: it
+		// can only see errors once it reads, and treats an empty archive as
+		// "not there" (ParseEnvFile, the action.yml/action.yaml fallback).
+		if err := tw.Close(); err != nil {
+			return status.Errorf(codes.Internal, "copyout: %v", err)
+		}
+		return w.flush()
+	}
+	if err != nil {
+		return status.Errorf(codes.Internal, "copyout: %v", err)
+	}
 	if fi.IsDir() {
 		err = tw.AddFS(os.DirFS(src))
 	} else {

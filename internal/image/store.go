@@ -25,7 +25,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
@@ -318,7 +317,8 @@ func (s *Store) remoteOptions(ctx context.Context) []remote.Option {
 	return []remote.Option{
 		remote.WithContext(ctx),
 		remote.WithPlatform(v1.Platform{OS: "linux", Architecture: runtime.GOARCH}),
-		remote.WithAuthFromKeychain(authn.DefaultKeychain),
+		// Anonymous on purpose: image references come from jobs, so any
+		// credential here would let every job read what it can read.
 		remote.WithTransport(publicOnlyTransport),
 	}
 }

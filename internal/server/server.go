@@ -401,6 +401,10 @@ func (s *Server) Exec(req *pb.ExecRequest, stream grpc.ServerStreamingServer[pb.
 		return err
 	}
 	defer e.mu.Unlock()
+	// The runner does not merge the image's ENV into steps (StartComplete's
+	// image_env only feeds GITHUB_PATH handling), so a golang image would
+	// lose /usr/local/go/bin. Layer it under the step's own variables.
+	req.Env = mergeImageEnv(e.img.Env, req.GetEnv())
 	if req.User == nil && e.img.User != "" {
 		u := e.img.User
 		req.User = &u
@@ -636,4 +640,26 @@ func diskFreeGiB(path string) (int, error) {
 		return 0, err
 	}
 	return int(st.Bavail * uint64(st.Bsize) >> 30), nil
+}
+
+// mergeImageEnv layers a step's variables over the image's ENV. PATH is
+// joined: the step's entries first, then any image entries it lacks.
+func mergeImageEnv(image []string, step map[string]string) map[string]string {
+	out := imageEnv(image)
+	imagePath := out["PATH"]
+	for k, v := range step {
+		out[k] = v
+	}
+	if imagePath != "" && step["PATH"] != "" {
+		seen := map[string]bool{}
+		var parts []string
+		for _, p := range append(strings.Split(step["PATH"], ":"), strings.Split(imagePath, ":")...) {
+			if p != "" && !seen[p] {
+				seen[p] = true
+				parts = append(parts, p)
+			}
+		}
+		out["PATH"] = strings.Join(parts, ":")
+	}
+	return out
 }

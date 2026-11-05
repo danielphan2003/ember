@@ -15,9 +15,7 @@ import (
 
 	pb "github.com/danielphan2003/ember/internal/pluginpb"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 )
 
@@ -219,14 +217,25 @@ func TestCopyInAndOut(t *testing.T) {
 	}
 }
 
-func TestCopyOutMissing(t *testing.T) {
+func TestCopyOutMissingIsEmptyArchive(t *testing.T) {
 	c := client(t)
 	s, err := c.CopyOut(context.Background(), &pb.CopyOutRequest{SrcPath: "/nonexistent/ember"})
-	if err == nil {
-		_, err = s.Recv()
+	if err != nil {
+		t.Fatal(err)
 	}
-	if status.Code(err) != codes.NotFound {
-		t.Fatalf("want NotFound, got %v", err)
+	var buf bytes.Buffer
+	for {
+		ch, err := s.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		buf.Write(ch.GetData())
+	}
+	if _, err := tar.NewReader(&buf).Next(); !errors.Is(err, io.EOF) {
+		t.Fatalf("want an empty archive, got %v", err)
 	}
 }
 

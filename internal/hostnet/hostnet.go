@@ -8,7 +8,8 @@
 //   - guests cannot reach the host (input from the taps is dropped),
 //   - guests cannot reach each other, private networks, the tailnet's CGNAT
 //     range, link-local or multicast addresses,
-//   - guests have no IPv6,
+//   - guests have no IPv6 and only TCP, UDP and ICMP (no 6in4 or GRE
+//     tunnels), at most 4096 tracked connections each, and no SMTP,
 //   - a guest can only send from its own address,
 //   - everything else is masqueraded to the internet.
 package hostnet
@@ -61,6 +62,11 @@ func Ruleset(cfg config.Config) string {
 		type ifname . ipv4_addr
 		elements = { %[3]s }
 	}
+	set flows {
+		type ipv4_addr
+		size 65535
+		flags dynamic
+	}
 	chain input {
 		type filter hook input priority filter - 10; policy accept;
 		iifname @taps drop
@@ -71,7 +77,9 @@ func Ruleset(cfg config.Config) string {
 		iifname @taps iifname . ip saddr != @slots drop
 		iifname @taps oifname @taps drop
 		iifname @taps ip daddr @blocked4 drop
+		iifname @taps ip protocol != { tcp, udp, icmp } drop
 		iifname @taps tcp dport 25 drop
+		iifname @taps ct state new add @flows { ip saddr ct count over 4096 } drop
 		oifname @taps ct state != { established, related } drop
 	}
 	chain postrouting {
