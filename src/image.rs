@@ -251,6 +251,7 @@ impl Store {
                 self.builds.acquire().await?
             }
         };
+        fs::create_dir_all(&self.dir)?;
         self.check_free_space(0)?;
         progress(format!("pulling {} ({})", r.name(), resolved.digest));
         let started = std::time::Instant::now();
@@ -267,6 +268,8 @@ impl Store {
         let mut downloaded = 0u64;
         for (i, layer) in resolved.layers.iter().enumerate() {
             let mut blob = tempfile::tempfile_in(tmp.path())?;
+            // Each download must fit above the floor before it starts.
+            self.check_free_space(layer.size)?;
             let budget = self.max_bytes.saturating_sub(downloaded);
             self.client.blob(r, layer, budget, &mut blob).await?;
             downloaded += blob.metadata()?.len();
@@ -333,16 +336,21 @@ impl Store {
     fn check_free_space(&self, need: u64) -> Result<()> {
         let c = CString::new(self.dir.as_os_str().as_encoded_bytes())?;
         let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-        if unsafe { libc::statvfs(c.as_ptr(), &mut st) } == 0 {
-            let free = st.f_bavail * st.f_frsize;
-            if free < self.min_free.saturating_add(need) {
-                bail!(
-                    "only {} GiB free for images, {} GiB needed above min_free_gib {}; not building",
-                    free >> 30,
-                    need.div_ceil(1 << 30),
-                    self.min_free >> 30
-                );
-            }
+        if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+            return Err(io::Error::last_os_error()).context("check free space");
+        }
+        let free = st.f_bavail * st.f_frsize;
+        if free < self.min_free.saturating_add(need) {
+            let needed = if need > 0 {
+                format!(" ({} MiB needed on top)", need.div_ceil(1 << 20))
+            } else {
+                String::new()
+            };
+            bail!(
+                "only {} GiB free for images, below min_free_gib {}{needed}; not building",
+                free >> 30,
+                self.min_free >> 30
+            );
         }
         Ok(())
     }
@@ -544,6 +552,9 @@ impl Unpack {
                         match ext.key() {
                             Ok("path") => long_name = Some(text(ext.value_bytes())),
                             Ok("linkpath") => long_link = Some(text(ext.value_bytes())),
+                            Ok(k) if k.starts_with("GNU.sparse.") => {
+                                bail!("sparse tar members are not supported");
+                            }
                             Ok(k @ ("uid" | "gid")) => {
                                 let v = ext.value().ok().and_then(|v| v.parse().ok());
                                 let v = Some(v.ok_or_else(|| anyhow!("unparseable PAX {k}"))?);
@@ -1062,5 +1073,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut u = Unpack::new(dir.path(), 1 << 20, Default::default()).unwrap();
         assert!(u.layer(&b.into_inner().unwrap()[..]).is_err());
+    }
+
+    #[test]
+    fn deep_paths_under_the_limit_unpack() {
+        // About 2,000 components, just under PATH_MAX: exercises the
+        // ensure_dir loop rather than the length check.
+        let deep = format!("{}f", "a/".repeat(2000));
+        let dir = tempfile::tempdir().unwrap();
+        let mut u = Unpack::new(dir.path(), 1 << 20, Default::default()).unwrap();
+        u.layer(&layer(&[(&deep, F, 0o644, 0, 0, "")])[..]).unwrap();
     }
 }

@@ -166,17 +166,19 @@ impl Server {
         let _ = std::fs::remove_dir_all(self.0.cfg.state_dir.join("vms"));
     }
 
-    /// Removes VM directories that belong to no environment, such as one a
-    /// cancelled boot recreated after teardown. Environments are registered
-    /// before their directory exists, so this never races a live one.
+    /// Removes VM directories that belong to no environment, left by a
+    /// crash during teardown, say. Entries are listed before the live set
+    /// is taken, and environments are registered before their directory
+    /// exists, so a live one is never removed.
     pub fn prune_vm_dirs(&self) -> usize {
         let Ok(entries) = std::fs::read_dir(self.0.cfg.state_dir.join("vms")) else {
             return 0;
         };
+        let entries: Vec<_> = entries.flatten().collect();
         let live: std::collections::HashSet<String> =
             self.0.envs.lock().unwrap().keys().cloned().collect();
         entries
-            .flatten()
+            .into_iter()
             .filter(|e| !live.contains(&*e.file_name().to_string_lossy()))
             .filter(|e| std::fs::remove_dir_all(e.path()).is_ok())
             .count()

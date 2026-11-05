@@ -74,6 +74,7 @@ impl pb::backend_plugin_server::BackendPlugin for Agent {
             let out = Arc::new(ExecSink {
                 tx: Mutex::new(Some(tx)),
                 last: std::sync::Mutex::new(std::time::Instant::now()),
+                sending: Default::default(),
             });
             if let Err(msg) = run(req, out.clone(), watcher).await {
                 out.finish(exec_output::Output::ExecFailed(pb::ExecFailed {
@@ -160,14 +161,26 @@ impl pb::backend_plugin_server::BackendPlugin for Agent {
 struct ExecSink {
     tx: Mutex<Option<ExecTx>>,
     last: std::sync::Mutex<std::time::Instant>,
+    /// Sends in progress: a send held up by backpressure is not idleness.
+    sending: std::sync::atomic::AtomicUsize,
 }
 
 impl ExecSink {
     fn idle(&self) -> Duration {
+        if self.sending.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+            return Duration::ZERO;
+        }
         self.last.lock().unwrap().elapsed()
     }
 
     async fn data(&self, stream: data_chunk::Stream, data: Vec<u8>) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.sending.fetch_add(1, Relaxed);
+        self.data_inner(stream, data).await;
+        self.sending.fetch_sub(1, Relaxed);
+    }
+
+    async fn data_inner(&self, stream: data_chunk::Stream, data: Vec<u8>) {
         *self.last.lock().unwrap() = std::time::Instant::now();
         if let Some(tx) = self.tx.lock().await.as_ref() {
             let chunk = DataChunk {
