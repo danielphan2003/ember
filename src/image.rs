@@ -251,7 +251,7 @@ impl Store {
                 self.builds.acquire().await?
             }
         };
-        self.check_free_space()?;
+        self.check_free_space(0)?;
         progress(format!("pulling {} ({})", r.name(), resolved.digest));
         let started = std::time::Instant::now();
         fs::create_dir_all(&self.dir)?;
@@ -290,7 +290,9 @@ impl Store {
 
         // Leave room for the job: at least disk_gib, and half again the content.
         let fs_bytes = self.min_bytes.max(size + size / 2 + (512 << 20));
-        self.check_free_space()?;
+        // The new filesystem must fit above the floor too. It is sparse, so
+        // it takes about the content's size, not its nominal size.
+        self.check_free_space(size)?;
         let ext4 = tmp.path().join("rootfs.ext4");
         let (tree2, ext42) = (tree.clone(), ext4.clone());
         tokio::task::spawn_blocking(move || build_ext4(&tree2, &ext42, fs_bytes, &fixups, &cancel))
@@ -326,16 +328,18 @@ impl Store {
         self.load(&resolved.digest)
     }
 
-    /// Refuses to go on below min_free_gib in the cache's filesystem.
-    fn check_free_space(&self) -> Result<()> {
+    /// Refuses to go on unless `need` bytes fit above min_free_gib in the
+    /// cache's filesystem.
+    fn check_free_space(&self, need: u64) -> Result<()> {
         let c = CString::new(self.dir.as_os_str().as_encoded_bytes())?;
         let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
         if unsafe { libc::statvfs(c.as_ptr(), &mut st) } == 0 {
             let free = st.f_bavail * st.f_frsize;
-            if free < self.min_free {
+            if free < self.min_free.saturating_add(need) {
                 bail!(
-                    "only {} GiB free for images (min_free_gib is {}); not building",
+                    "only {} GiB free for images, {} GiB needed above min_free_gib {}; not building",
                     free >> 30,
+                    need.div_ceil(1 << 30),
                     self.min_free >> 30
                 );
             }

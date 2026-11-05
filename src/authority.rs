@@ -106,6 +106,9 @@ pub async fn rewrite(
             continue;
         }
         let mut block = header_fragment(flags, &payload)?;
+        if block.len() > MAX_BLOCK {
+            return Err(bad("header block too large"));
+        }
         let mut end = flags & END_HEADERS != 0;
         while !end {
             let (k, f, s, p) = read_frame(r)
