@@ -41,7 +41,15 @@ pub struct Reference {
 impl Reference {
     pub fn parse(s: &str) -> Result<Self> {
         let (rest, digest) = match s.split_once('@') {
-            Some((r, d)) if d.starts_with("sha256:") && d.len() == 71 => (r, Some(d.to_string())),
+            Some((r, d))
+                if d.len() == 71
+                    && d.starts_with("sha256:")
+                    && d[7..]
+                        .bytes()
+                        .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)) =>
+            {
+                (r, Some(d.to_string()))
+            }
             Some(_) => bail!("image {s:?}: only sha256 digests are supported"),
             None => (s, None),
         };

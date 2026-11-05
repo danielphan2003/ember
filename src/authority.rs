@@ -129,19 +129,26 @@ pub async fn rewrite(
             }
         }
         let encoded = encoder.encode(headers.iter().map(|(n, v)| (n.as_slice(), v.as_slice())));
-        let mut chunks = encoded.chunks(MAX_FRAME).peekable();
-        let mut first = true;
-        while let Some(chunk) = chunks.next() {
-            let last = chunks.peek().is_none();
-            let mut f = if last { END_HEADERS } else { 0 };
-            let k = if first {
+        // chunks() of an empty block yields nothing; a HEADERS frame must
+        // still go out.
+        let chunks: Vec<&[u8]> = if encoded.is_empty() {
+            vec![&[]]
+        } else {
+            encoded.chunks(MAX_FRAME).collect()
+        };
+        for (i, chunk) in chunks.iter().enumerate() {
+            let mut f = if i + 1 == chunks.len() {
+                END_HEADERS
+            } else {
+                0
+            };
+            let k = if i == 0 {
                 f |= flags & END_STREAM;
                 HEADERS
             } else {
                 CONTINUATION
             };
             write_frame(w, k, f, stream, chunk).await?;
-            first = false;
         }
     }
 }

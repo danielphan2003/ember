@@ -242,7 +242,7 @@ async fn e2e_network_isolation() {
     );
     // SMTP is dropped.
     assert_ne!(
-        a.sh("nc -z -w 3 smtp.gmail.com 25").await.1,
+        a.sh("nc -z -w 3 smtp.gmail.com 25 || nc -z -w 3 smtp.gmail.com 587 || nc -z -w 3 smtp.gmail.com 465").await.1,
         0,
         "outbound SMTP is open"
     );

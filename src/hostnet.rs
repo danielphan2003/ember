@@ -8,8 +8,8 @@
 //! - nor each other, private networks, the tailnet's CGNAT range,
 //!   link-local or multicast addresses,
 //! - guests have no IPv6 and only TCP, UDP and ICMP (no 6in4 or GRE
-//!   tunnels), at most 4096 tracked connections each, and no port 25 (mail
-//!   relaying from your address),
+//!   tunnels), at most 4096 tracked connections each, and no mail
+//!   submission (ports 25, 465, 587, 2525) from your address,
 //! - a guest can only send from its own address,
 //! - everything else is masqueraded to the internet.
 //!
@@ -78,7 +78,7 @@ pub fn ruleset(cfg: &Config) -> String {
 		iifname @taps oifname @taps drop
 		iifname @taps ip daddr @blocked4 drop
 		iifname @taps ip protocol != {{ tcp, udp, icmp }} drop
-		iifname @taps tcp dport 25 drop
+		iifname @taps tcp dport {{ 25, 465, 587, 2525 }} drop
 		iifname @taps ct state new add @flows {{ ip saddr ct count over 4096 }} drop
 		oifname @taps ct state != {{ established, related }} drop
 	}}
@@ -247,6 +247,8 @@ fn firewalld_running() -> bool {
 
 /// Puts the taps in a zone named after the tap prefix with target DROP: if
 /// ember's table were ever flushed, the host would still refuse the guests.
+/// (Their forwarded traffic would then be unfiltered but also un-NATed, as
+/// the masquerade rule lives in the same table, so it could not get out.)
 /// A policy from that zone to every other zone lets forwarded traffic
 /// through firewalld; ember's table filters it first. The bindings are
 /// permanent, so `firewall-cmd --reload` keeps them.

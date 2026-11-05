@@ -39,7 +39,8 @@ Forgejo ◀──── forgejo-runner ──gRPC (plugin.v1alpha)──▶ embe
   private or CGNAT (tailnet) ranges, link-local addresses such as cloud
   metadata, or IPv6, and they cannot spoof another slot's address. Only
   TCP, UDP and ICMP leave (so no 6in4 or GRE tunnels), each guest may hold
-  4096 tracked connections, and outbound SMTP is dropped. A public NAT64
+  4096 tracked connections, and mail ports (25, 465, 587, 2525) are dropped,
+  so jobs cannot send mail from your address. A public NAT64
   service would still give a guest IPv6 reach; no rule can tell it apart. The
   end-to-end test checks each of these from inside a VM.
 - **Privileges.** `ember serve` and every Firecracker process run as the
@@ -146,7 +147,8 @@ and ember keeps serving the others.
 - No service containers (`services:`) and no Docker inside jobs yet; the job
   fails with a clear message if it asks for services. A step may start a
   server in the background (`server &`) and use it in later steps.
-- Guests have no inbound connections and cannot send mail (port 25).
+- Guests have no inbound connections and cannot send mail (ports 25, 465,
+  587 and 2525 are dropped).
 - The runner's cache server is unreachable from guests, so `actions/cache`
   misses. Large dependencies are better baked into the job image.
 - Images are pulled anonymously, on purpose: image references come from

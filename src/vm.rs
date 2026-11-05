@@ -162,6 +162,14 @@ pub fn boot(spec: &Spec) -> Result<Machine> {
     })
 }
 
+/// A Machine that goes away without destroy (a Start dropped mid-boot, say)
+/// must not leave its VM running on a slot ember thinks is free.
+impl Drop for Machine {
+    fn drop(&mut self) {
+        self.killer.kill();
+    }
+}
+
 impl Machine {
     fn vsock_path(&self) -> PathBuf {
         self.dir.join("vsock.sock")

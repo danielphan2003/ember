@@ -65,6 +65,10 @@ pub struct Store {
     client: Arc<Client>,
     pulls: Mutex<HashMap<String, Pull>>,
     refs_lock: Mutex<()>,
+    /// One image build at a time: each can need tens of GiB of scratch
+    /// space on a disk shared with the host's services.
+    builds: tokio::sync::Semaphore,
+    min_free: u64,
 }
 
 impl Store {
@@ -74,6 +78,7 @@ impl Store {
         refresh: Duration,
         min_gib: u32,
         max_mib: u64,
+        min_free_gib: u64,
     ) -> Result<Arc<Self>> {
         let agent_id = hex::encode(&Sha256::digest(agent)[..6]);
         Ok(Arc::new(Self {
@@ -86,6 +91,8 @@ impl Store {
             client: Arc::new(Client::new()?),
             pulls: Mutex::new(HashMap::new()),
             refs_lock: Mutex::new(()),
+            builds: tokio::sync::Semaphore::new(1),
+            min_free: min_free_gib << 30,
         }))
     }
 
@@ -237,6 +244,14 @@ impl Store {
             self.save_ref(&r.name(), entry);
             return Ok(img);
         }
+        let _build = match self.builds.try_acquire() {
+            Ok(p) => p,
+            Err(_) => {
+                progress("waiting for another image build to finish".into());
+                self.builds.acquire().await?
+            }
+        };
+        self.check_free_space()?;
         progress(format!("pulling {} ({})", r.name(), resolved.digest));
         let started = std::time::Instant::now();
         fs::create_dir_all(&self.dir)?;
@@ -275,6 +290,7 @@ impl Store {
 
         // Leave room for the job: at least disk_gib, and half again the content.
         let fs_bytes = self.min_bytes.max(size + size / 2 + (512 << 20));
+        self.check_free_space()?;
         let ext4 = tmp.path().join("rootfs.ext4");
         let (tree2, ext42) = (tree.clone(), ext4.clone());
         tokio::task::spawn_blocking(move || build_ext4(&tree2, &ext42, fs_bytes, &fixups, &cancel))
@@ -308,6 +324,23 @@ impl Store {
             started.elapsed().as_secs_f64()
         ));
         self.load(&resolved.digest)
+    }
+
+    /// Refuses to go on below min_free_gib in the cache's filesystem.
+    fn check_free_space(&self) -> Result<()> {
+        let c = CString::new(self.dir.as_os_str().as_encoded_bytes())?;
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(c.as_ptr(), &mut st) } == 0 {
+            let free = st.f_bavail * st.f_frsize;
+            if free < self.min_free {
+                bail!(
+                    "only {} GiB free for images (min_free_gib is {}); not building",
+                    free >> 30,
+                    self.min_free >> 30
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Removes cached images not used within keep, and stale build
@@ -441,6 +474,24 @@ impl Unpack {
         }
     }
 
+    /// Creates a directory and any missing ancestors as 0755, whatever the
+    /// process umask: layers often omit entries for parent directories.
+    fn ensure_dir(&self, dir: &Path) -> Result<()> {
+        if self.root.symlink_metadata(dir).is_ok() {
+            return Ok(());
+        }
+        if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+            self.ensure_dir(parent)?;
+        }
+        if let Err(e) = self.root.create_dir(dir)
+            && e.kind() != io::ErrorKind::AlreadyExists
+        {
+            return Err(e.into());
+        }
+        self.root.set_permissions(dir, perms(0o755))?;
+        Ok(())
+    }
+
     /// Applies one layer. GNU long names and PAX headers are handled here,
     /// with a size cap, rather than by the tar crate.
     pub fn layer(&mut self, r: impl Read) -> Result<()> {
@@ -546,7 +597,7 @@ impl Unpack {
             }
 
             if !parent.as_os_str().is_empty() {
-                self.root.create_dir_all(&parent)?;
+                self.ensure_dir(&parent)?;
             }
             let perm = h.mode().unwrap_or(0o644) & 0o7777;
             let (ftype, written) =

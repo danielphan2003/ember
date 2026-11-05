@@ -147,6 +147,11 @@ pub fn untar(r: impl Read, dest: &Path) -> io::Result<()> {
                     &target,
                     cap_std::fs::Permissions::from_std(Permissions::from_mode(mode | 0o700)),
                 )?;
+                let (uid, gid) = (h.uid().unwrap_or(0) as u32, h.gid().unwrap_or(0) as u32);
+                if uid != 0 || gid != 0 {
+                    let d = root.open_dir(&target)?;
+                    let _ = std::os::unix::fs::fchown(&d, Some(uid), Some(gid));
+                }
             }
             tar::EntryType::Regular | tar::EntryType::Continuous => {
                 if let Some(p) = parent {

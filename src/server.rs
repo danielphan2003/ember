@@ -128,6 +128,7 @@ impl Server {
             cfg.image_refresh,
             cfg.disk_gib,
             cfg.max_image_mib,
+            cfg.min_free_gib,
         )?;
         let mem_budget = match cfg.memory_budget_mib {
             0 => meminfo_mib("MemTotal:")
@@ -441,9 +442,9 @@ impl pb::backend_plugin_server::BackendPlugin for Server {
             .and_then(|d| Duration::try_from(d).ok())
             .filter(|d| !d.is_zero())
             .unwrap_or(DEFAULT_LIFETIME);
-        self.0.envs.lock().unwrap().insert(id.clone(), e.clone());
         // The lifetime runs from Create, so an environment whose Remove never
-        // comes (the runner restarted mid-job) still gives its slot back.
+        // comes (the runner restarted mid-job) still gives its slot back. The
+        // handle is in place before the environment is visible to Remove.
         let (server, env) = (self.clone(), e.clone());
         let timer = tokio::spawn(async move {
             tokio::time::sleep(lifetime).await;
@@ -452,6 +453,7 @@ impl pb::backend_plugin_server::BackendPlugin for Server {
             server.destroy(&env).await;
         });
         *e.lifetime.lock().unwrap() = Some(timer.abort_handle());
+        self.0.envs.lock().unwrap().insert(id.clone(), e.clone());
         info!(env = %id, image = %e.image_ref, vcpus = e.vcpus, memory_mib = e.memory_mib, "create");
         Ok(Response::new(CreateResponse {
             environment_id: id,
