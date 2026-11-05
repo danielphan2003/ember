@@ -1,0 +1,15 @@
+# Development configuration: everything lives in the checkout.
+#   just build fetch
+#   sudo dist/ember host up --config examples/dev.yaml   # taps owned by you
+#   dist/ember serve --config examples/dev.yaml &
+#   dist/ember run --config examples/dev.yaml -- uname -a
+listen: unix://.ember-dev/ember.sock
+state_dir: .ember-dev
+firecracker: dist/firecracker
+kernel: dist/vmlinux
+user: ""            # empty: the user who ran sudo owns the taps
+slots: 2
+tap_prefix: embdev
+subnet: 172.31.255.0/24
+memory_mib: 1024
+disk_gib: 4

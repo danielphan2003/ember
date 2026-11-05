@@ -1,0 +1,35 @@
+# /etc/ember/runner.yaml: forgejo-runner (>= 13.1) with ember as its only backend.
+log:
+  level: info
+
+runner:
+  capacity: 8          # match `slots` in /etc/ember/config.yaml
+  timeout: 1h
+  fetch_interval: 2s
+
+# Guests cannot reach the host, so the runner's built-in cache server is of
+# no use to them.
+cache:
+  enabled: false
+
+# Each entry is a VM flavour. They share one ember; options size the VM.
+plugins:
+  ember:
+    address: unix:///run/ember/ember.sock
+  ember-large:
+    address: unix:///run/ember/ember.sock
+    options:
+      vcpus: "4"
+      memory_mib: "8192"
+
+server:
+  connections:
+    forgejo:
+      url: https://forgejo.example.com/
+      uuid: 00000000-0000-0000-0000-000000000000
+      token_url: file:$CREDENTIALS_DIRECTORY/forgejo-token
+      # runs-on: <label>. The part after :// is the default image; a job's
+      # `container: image:` replaces it.
+      labels:
+        - ember:ember://docker.io/library/node:24-trixie
+        - ember-large:ember-large://docker.io/library/node:24-trixie

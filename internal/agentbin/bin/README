@@ -1,0 +1,1 @@
+The build places the static ember-agent binary here; see the justfile.
