@@ -25,6 +25,10 @@ if [[ ${1:-} == --uninstall ]]; then
   rm -f /usr/local/bin/ember /usr/local/bin/forgejo-runner /etc/sysusers.d/ember.conf
   rm -rf /usr/local/lib/ember
   echo "removed ember; /etc/ember, /var/lib/ember and /var/lib/forgejo-runner are left in place"
+  if firewall-cmd --state >/dev/null 2>&1; then
+    echo "firewalld still has zone ember and policy ember-egress (named after tap_prefix); delete them with:"
+    echo "  firewall-cmd --permanent --delete-policy=ember-egress && firewall-cmd --permanent --delete-zone=ember && firewall-cmd --reload"
+  fi
   exit 0
 fi
 

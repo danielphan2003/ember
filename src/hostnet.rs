@@ -15,7 +15,11 @@
 //!
 //! iproute2, nft and (if running) firewall-cmd do the work.
 
-use std::process::{Command, Stdio};
+use std::{
+    process::{Command, Stdio},
+    thread::sleep,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 
@@ -195,14 +199,17 @@ pub fn up(cfg: &Config) -> Result<()> {
     println!("nftables table inet {t} installed");
     std::fs::write("/proc/sys/net/ipv4/ip_forward", "1").context("enable ip_forward")?;
 
-    if firewalld_running() {
+    if firewalld_wanted() {
+        wait_for_firewalld()?;
         firewalld_up(cfg)?;
         println!("firewalld zone {t} holds the tap devices");
     }
     Ok(())
 }
 
-/// Removes the taps, the ruleset and the firewalld bindings.
+/// Removes the taps and the ruleset. The firewalld zone keeps its permanent
+/// bindings: this runs at every shutdown, and the bindings make firewalld
+/// put the taps back in the DROP zone the moment `up` recreates them.
 pub fn down(cfg: &Config) -> Result<()> {
     let mut errs = vec![];
     for s in cfg.slot_list() {
@@ -218,22 +225,8 @@ pub fn down(cfg: &Config) -> Result<()> {
     {
         errs.push(e.to_string());
     }
-    if firewalld_running() {
-        for s in cfg.slot_list() {
-            let _ = run(
-                "firewall-cmd",
-                &[
-                    "--permanent",
-                    &format!("--zone={t}"),
-                    &format!("--remove-interface={}", s.tap),
-                ],
-                None,
-            );
-        }
-        let _ = run("firewall-cmd", &["--reload"], None);
-    }
     println!(
-        "removed taps and table inet {t} (ip_forward and the empty firewalld zone are left as they are)"
+        "removed taps and table inet {t} (ip_forward, the firewalld zone {t} and policy {t}-egress are left as they are)"
     );
     if !errs.is_empty() {
         bail!(errs.join("; "));
@@ -241,8 +234,46 @@ pub fn down(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-fn firewalld_running() -> bool {
+pub fn firewalld_running() -> bool {
     run("firewall-cmd", &["--state"], None).is_ok_and(|s| s == "running")
+}
+
+/// Whether firewalld is running or about to: at boot, `up` can start while
+/// firewalld is still loading, and skipping the zone then leaves the taps
+/// in the default zone, which rejects their forwarded traffic.
+pub fn firewalld_wanted() -> bool {
+    // is-active exits non-zero for "activating", so read its output directly.
+    firewalld_running()
+        || Command::new("systemctl")
+            .args(["is-active", "firewalld.service"])
+            .stderr(Stdio::null())
+            .output()
+            .is_ok_and(|o| {
+                matches!(
+                    String::from_utf8_lossy(&o.stdout).trim(),
+                    "active" | "activating" | "reloading"
+                )
+            })
+}
+
+fn wait_for_firewalld() -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while !firewalld_running() {
+        if Instant::now() > deadline {
+            bail!("firewalld is starting but did not report running within 90s");
+        }
+        sleep(Duration::from_millis(500));
+    }
+    Ok(())
+}
+
+/// The firewalld zone a tap is in. Works without root.
+pub fn firewalld_zone_of(tap: &str) -> Result<String> {
+    run(
+        "firewall-cmd",
+        &[&format!("--get-zone-of-interface={tap}")],
+        None,
+    )
 }
 
 /// Puts the taps in a zone named after the tap prefix with target DROP: if
