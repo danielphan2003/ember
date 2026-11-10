@@ -200,9 +200,15 @@ pub fn up(cfg: &Config) -> Result<()> {
     std::fs::write("/proc/sys/net/ipv4/ip_forward", "1").context("enable ip_forward")?;
 
     if firewalld_wanted() {
-        wait_for_firewalld()?;
-        firewalld_up(cfg)?;
-        println!("firewalld zone {t} holds the tap devices");
+        if wait_for_firewalld()? {
+            firewalld_up(cfg)?;
+            println!("firewalld zone {t} holds the tap devices");
+        } else {
+            // Nothing is enforcing firewalld's zones, so the guests are not
+            // rejected; the table above isolates them, and the permanent
+            // bindings apply once firewalld runs again.
+            eprintln!("warning: firewalld stopped while starting; zone {t} is not applied");
+        }
     }
     Ok(())
 }
@@ -256,15 +262,19 @@ pub fn firewalld_wanted() -> bool {
             })
 }
 
-fn wait_for_firewalld() -> Result<()> {
+/// Waits until firewalld runs (true) or gives up starting (false).
+fn wait_for_firewalld() -> Result<bool> {
     let deadline = Instant::now() + Duration::from_secs(90);
     while !firewalld_running() {
+        if !firewalld_wanted() {
+            return Ok(false);
+        }
         if Instant::now() > deadline {
             bail!("firewalld is starting but did not report running within 90s");
         }
         sleep(Duration::from_millis(500));
     }
-    Ok(())
+    Ok(true)
 }
 
 /// The firewalld zone a tap is in. Works without root.
@@ -320,11 +330,32 @@ fn firewalld_up(cfg: &Config) -> Result<()> {
             "--add-egress-zone=ANY",
         ])?;
     }
-    for s in cfg.slot_list() {
+    let taps: Vec<String> = cfg.slot_list().into_iter().map(|s| s.tap).collect();
+    // Bindings outlive `down`, so drop those of slots that no longer exist.
+    let bound = run(
+        "firewall-cmd",
+        &[
+            "--permanent",
+            &format!("--zone={zone}"),
+            "--list-interfaces",
+        ],
+        None,
+    )?;
+    for old in bound
+        .split_whitespace()
+        .filter(|i| !taps.iter().any(|t| t == i))
+    {
         fw(&[
             "--permanent",
             &format!("--zone={zone}"),
-            &format!("--change-interface={}", s.tap),
+            &format!("--remove-interface={old}"),
+        ])?;
+    }
+    for tap in &taps {
+        fw(&[
+            "--permanent",
+            &format!("--zone={zone}"),
+            &format!("--change-interface={tap}"),
         ])?;
     }
     fw(&["--reload"])
