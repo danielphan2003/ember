@@ -205,9 +205,12 @@ pub fn up(cfg: &Config) -> Result<()> {
             println!("firewalld zone {t} holds the tap devices");
         } else {
             // Nothing is enforcing firewalld's zones, so the guests are not
-            // rejected; the table above isolates them, and the permanent
-            // bindings apply once firewalld runs again.
-            eprintln!("warning: firewalld stopped while starting; zone {t} is not applied");
+            // rejected; the table above isolates them. Bindings from an
+            // earlier `up`, if any, apply once firewalld runs again.
+            eprintln!(
+                "warning: firewalld stopped while starting; zone {t} is not applied. \
+                 Run `ember host up` again once firewalld runs."
+            );
         }
     }
     Ok(())
@@ -240,8 +243,19 @@ pub fn down(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
+/// What `firewall-cmd --state` prints ("running", "not running", "failed"),
+/// whatever its exit code.
+fn firewalld_state() -> String {
+    Command::new("firewall-cmd")
+        .arg("--state")
+        .stderr(Stdio::null())
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
 pub fn firewalld_running() -> bool {
-    run("firewall-cmd", &["--state"], None).is_ok_and(|s| s == "running")
+    firewalld_state() == "running"
 }
 
 /// Whether firewalld is running or about to: at boot, `up` can start while
@@ -249,23 +263,33 @@ pub fn firewalld_running() -> bool {
 /// in the default zone, which rejects their forwarded traffic.
 pub fn firewalld_wanted() -> bool {
     // is-active exits non-zero for "activating", so read its output directly.
-    firewalld_running()
-        || Command::new("systemctl")
-            .args(["is-active", "firewalld.service"])
-            .stderr(Stdio::null())
-            .output()
-            .is_ok_and(|o| {
-                matches!(
-                    String::from_utf8_lossy(&o.stdout).trim(),
-                    "active" | "activating" | "reloading"
-                )
-            })
+    // systemd first: an unprivileged `firewall-cmd --state` needs polkit,
+    // which can pop up an authorization dialog on a desktop.
+    Command::new("systemctl")
+        .args(["is-active", "firewalld.service"])
+        .stderr(Stdio::null())
+        .output()
+        .is_ok_and(|o| {
+            matches!(
+                String::from_utf8_lossy(&o.stdout).trim(),
+                "active" | "activating" | "reloading"
+            )
+        })
+        || firewalld_running()
 }
 
 /// Waits until firewalld runs (true) or gives up starting (false).
 fn wait_for_firewalld() -> Result<bool> {
     let deadline = Instant::now() + Duration::from_secs(90);
-    while !firewalld_running() {
+    loop {
+        match firewalld_state().as_str() {
+            "running" => return Ok(true),
+            // Its configuration did not load; it runs a fallback one.
+            "failed" => bail!(
+                "firewalld is in its failed state (see `firewall-offline-cmd --check-config`)"
+            ),
+            _ => {}
+        }
         if !firewalld_wanted() {
             return Ok(false);
         }
@@ -274,7 +298,6 @@ fn wait_for_firewalld() -> Result<bool> {
         }
         sleep(Duration::from_millis(500));
     }
-    Ok(true)
 }
 
 /// The firewalld zone a tap is in. Works without root.
