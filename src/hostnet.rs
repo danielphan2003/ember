@@ -243,15 +243,22 @@ pub fn down(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-/// What `firewall-cmd --state` prints ("running", "not running", "failed"),
-/// whatever its exit code.
-fn firewalld_state() -> String {
-    Command::new("firewall-cmd")
+/// firewalld's state from `firewall-cmd --state`, decided by exit code:
+/// only "running" goes to stdout; "failed" (251, running a fallback config
+/// because its own did not load) and "not running" (252) go to stderr.
+fn firewalld_state() -> &'static str {
+    let code = Command::new("firewall-cmd")
         .arg("--state")
+        .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default()
+        .status()
+        .ok()
+        .and_then(|s| s.code());
+    match code {
+        Some(0) => "running",
+        Some(251) => "failed",
+        _ => "not running",
+    }
 }
 
 pub fn firewalld_running() -> bool {
@@ -282,7 +289,7 @@ pub fn firewalld_wanted() -> bool {
 fn wait_for_firewalld() -> Result<bool> {
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
-        match firewalld_state().as_str() {
+        match firewalld_state() {
             "running" => return Ok(true),
             // Its configuration did not load; it runs a fallback one.
             "failed" => bail!(
