@@ -414,6 +414,22 @@ fn doctor(cfg: &Config) -> Result<()> {
             }
         }
     }
+    // Outside ember's zone, firewalld's default zone rejects the guests'
+    // forwarded traffic, so jobs lose the network.
+    if hostnet::firewalld_wanted() {
+        for s in cfg.slot_list() {
+            let res = match hostnet::firewalld_zone_of(&s.tap) {
+                Ok(z) if z == cfg.tap_prefix => Ok(()),
+                Ok(z) => Err(anyhow::anyhow!("in zone {z}")),
+                Err(e) => Err(e),
+            };
+            check(
+                &format!("tap {} in firewalld zone {}", s.tap, cfg.tap_prefix),
+                res,
+                "run `sudo ember host up`",
+            );
+        }
+    }
     let fwd = std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward").unwrap_or_default();
     check(
         "IPv4 forwarding on",

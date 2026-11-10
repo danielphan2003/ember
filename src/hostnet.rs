@@ -15,7 +15,11 @@
 //!
 //! iproute2, nft and (if running) firewall-cmd do the work.
 
-use std::process::{Command, Stdio};
+use std::{
+    process::{Command, Stdio},
+    thread::sleep,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 
@@ -195,14 +199,26 @@ pub fn up(cfg: &Config) -> Result<()> {
     println!("nftables table inet {t} installed");
     std::fs::write("/proc/sys/net/ipv4/ip_forward", "1").context("enable ip_forward")?;
 
-    if firewalld_running() {
-        firewalld_up(cfg)?;
-        println!("firewalld zone {t} holds the tap devices");
+    if firewalld_wanted() {
+        if wait_for_firewalld()? {
+            firewalld_up(cfg)?;
+            println!("firewalld zone {t} holds the tap devices");
+        } else {
+            // Nothing is enforcing firewalld's zones, so the guests are not
+            // rejected; the table above isolates them. Bindings from an
+            // earlier `up`, if any, apply once firewalld runs again.
+            eprintln!(
+                "warning: firewalld stopped while starting; zone {t} is not applied. \
+                 Run `ember host up` again once firewalld runs."
+            );
+        }
     }
     Ok(())
 }
 
-/// Removes the taps, the ruleset and the firewalld bindings.
+/// Removes the taps and the ruleset. The firewalld zone keeps its permanent
+/// bindings: this runs at every shutdown, and the bindings make firewalld
+/// put the taps back in the DROP zone the moment `up` recreates them.
 pub fn down(cfg: &Config) -> Result<()> {
     let mut errs = vec![];
     for s in cfg.slot_list() {
@@ -218,22 +234,8 @@ pub fn down(cfg: &Config) -> Result<()> {
     {
         errs.push(e.to_string());
     }
-    if firewalld_running() {
-        for s in cfg.slot_list() {
-            let _ = run(
-                "firewall-cmd",
-                &[
-                    "--permanent",
-                    &format!("--zone={t}"),
-                    &format!("--remove-interface={}", s.tap),
-                ],
-                None,
-            );
-        }
-        let _ = run("firewall-cmd", &["--reload"], None);
-    }
     println!(
-        "removed taps and table inet {t} (ip_forward and the empty firewalld zone are left as they are)"
+        "removed taps and table inet {t} (ip_forward, the firewalld zone {t} and policy {t}-egress are left as they are)"
     );
     if !errs.is_empty() {
         bail!(errs.join("; "));
@@ -241,8 +243,77 @@ pub fn down(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-fn firewalld_running() -> bool {
-    run("firewall-cmd", &["--state"], None).is_ok_and(|s| s == "running")
+/// firewalld's state from `firewall-cmd --state`, decided by exit code:
+/// only "running" goes to stdout; "failed" (251, running a fallback config
+/// because its own did not load) and "not running" (252) go to stderr.
+fn firewalld_state() -> &'static str {
+    let code = Command::new("firewall-cmd")
+        .arg("--state")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()
+        .and_then(|s| s.code());
+    match code {
+        Some(0) => "running",
+        Some(251) => "failed",
+        _ => "not running",
+    }
+}
+
+pub fn firewalld_running() -> bool {
+    firewalld_state() == "running"
+}
+
+/// Whether firewalld is running or about to: at boot, `up` can start while
+/// firewalld is still loading, and skipping the zone then leaves the taps
+/// in the default zone, which rejects their forwarded traffic.
+pub fn firewalld_wanted() -> bool {
+    // is-active exits non-zero for "activating", so read its output directly.
+    // systemd first: an unprivileged `firewall-cmd --state` needs polkit,
+    // which can pop up an authorization dialog on a desktop.
+    Command::new("systemctl")
+        .args(["is-active", "firewalld.service"])
+        .stderr(Stdio::null())
+        .output()
+        .is_ok_and(|o| {
+            matches!(
+                String::from_utf8_lossy(&o.stdout).trim(),
+                "active" | "activating" | "reloading"
+            )
+        })
+        || firewalld_running()
+}
+
+/// Waits until firewalld runs (true) or gives up starting (false).
+fn wait_for_firewalld() -> Result<bool> {
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        match firewalld_state() {
+            "running" => return Ok(true),
+            // Its configuration did not load; it runs a fallback one.
+            "failed" => bail!(
+                "firewalld is in its failed state (see `firewall-offline-cmd --check-config`)"
+            ),
+            _ => {}
+        }
+        if !firewalld_wanted() {
+            return Ok(false);
+        }
+        if Instant::now() > deadline {
+            bail!("firewalld is starting but did not report running within 90s");
+        }
+        sleep(Duration::from_millis(500));
+    }
+}
+
+/// The firewalld zone a tap is in. Works without root.
+pub fn firewalld_zone_of(tap: &str) -> Result<String> {
+    run(
+        "firewall-cmd",
+        &[&format!("--get-zone-of-interface={tap}")],
+        None,
+    )
 }
 
 /// Puts the taps in a zone named after the tap prefix with target DROP: if
@@ -289,11 +360,32 @@ fn firewalld_up(cfg: &Config) -> Result<()> {
             "--add-egress-zone=ANY",
         ])?;
     }
-    for s in cfg.slot_list() {
+    let taps: Vec<String> = cfg.slot_list().into_iter().map(|s| s.tap).collect();
+    // Bindings outlive `down`, so drop those of slots that no longer exist.
+    let bound = run(
+        "firewall-cmd",
+        &[
+            "--permanent",
+            &format!("--zone={zone}"),
+            "--list-interfaces",
+        ],
+        None,
+    )?;
+    for old in bound
+        .split_whitespace()
+        .filter(|i| !taps.iter().any(|t| t == i))
+    {
         fw(&[
             "--permanent",
             &format!("--zone={zone}"),
-            &format!("--change-interface={}", s.tap),
+            &format!("--remove-interface={old}"),
+        ])?;
+    }
+    for tap in &taps {
+        fw(&[
+            "--permanent",
+            &format!("--zone={zone}"),
+            &format!("--change-interface={tap}"),
         ])?;
     }
     fw(&["--reload"])
