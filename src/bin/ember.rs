@@ -301,11 +301,14 @@ async fn copy_in(
         }
         Ok(())
     });
-    let sent = c.copy_in(ReceiverStream::new(rx)).await;
+    // After an RPC error the reader may still be blocked reading stdin: report
+    // the error now so the VM is removed, instead of waiting for it.
+    c.copy_in(ReceiverStream::new(rx))
+        .await
+        .context("copying --input into the VM")?;
     reader
         .await?
         .with_context(|| format!("reading --input {src}"))?;
-    sent.context("copying --input into the VM")?;
     Ok(())
 }
 
