@@ -117,6 +117,13 @@ Forgejo's runner images have it.
 sudo -u ember ember run -i docker.io/library/alpine:3.22 -- sh -c 'uname -a; nproc; free -m'
 ```
 
+`--input <tar>` (or `-` for stdin) extracts an archive into `/root/work` and
+runs the command there, so a checkout can go in without a network fetch:
+
+```sh
+git archive HEAD | sudo -u ember ember run --input - -- sh -c './ci.sh'
+```
+
 For development, `examples/dev.yaml` keeps everything inside the checkout:
 
 ```sh

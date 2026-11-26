@@ -15,14 +15,17 @@ use ember::{
     config::Config,
     hostnet,
     pb::{
-        self, CreateRequest, ExecRequest, RemoveRequest, StartRequest,
+        self, CopyInChunk, CreateRequest, ExecRequest, RemoveRequest, StartRequest,
         backend_plugin_client::BackendPluginClient, backend_plugin_server::BackendPluginServer,
         exec_output, start_output,
     },
     server::Server,
 };
 use hyper_util::rt::TokioIo;
-use tokio_stream::{StreamExt, wrappers::UnixListenerStream};
+use tokio_stream::{
+    StreamExt,
+    wrappers::{ReceiverStream, UnixListenerStream},
+};
 use tonic::transport::Endpoint;
 
 #[derive(Parser)]
@@ -57,6 +60,10 @@ enum Cmd {
         /// Do not print boot and timing lines.
         #[arg(short, long)]
         quiet: bool,
+        /// Tar archive extracted into /root/work, where the command then
+        /// runs; `-` reads it from stdin.
+        #[arg(long)]
+        input: Option<String>,
         #[arg(trailing_var_arg = true)]
         command: Vec<String>,
     },
@@ -95,8 +102,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
             vcpus,
             memory,
             quiet,
+            input,
             command,
-        } => run(cfg, image, vcpus, memory, quiet, command).await,
+        } => run(cfg, image, vcpus, memory, quiet, input, command).await,
         Cmd::Pull { images } => pull(cfg, images).await,
         Cmd::Prune => {
             let server = Server::new(cfg.clone(), AGENT)?;
@@ -215,6 +223,7 @@ async fn run(
     vcpus: Option<u32>,
     memory: Option<u32>,
     quiet: bool,
+    input: Option<String>,
     mut command: Vec<String>,
 ) -> Result<()> {
     if command.is_empty() {
@@ -245,7 +254,7 @@ async fn run(
         .await?
         .into_inner()
         .environment_id;
-    let code = run_in(&mut c, &id, command, quiet, t0).await;
+    let code = run_in(&mut c, &id, command, input, quiet, t0).await;
     let _ = c.remove(RemoveRequest { environment_id: id }).await;
     let code = code?;
     if code != 0 {
@@ -254,10 +263,57 @@ async fn run(
     Ok(())
 }
 
+const WORK: &str = "/root/work";
+
+/// Streams a tar archive (a file, or stdin for `-`) into WORK in the guest.
+async fn copy_in(
+    c: &mut BackendPluginClient<tonic::transport::Channel>,
+    id: &str,
+    src: String,
+) -> Result<()> {
+    let mut r: Box<dyn std::io::Read + Send> = if src == "-" {
+        Box::new(std::io::stdin())
+    } else {
+        Box::new(std::fs::File::open(&src).with_context(|| format!("--input {src}"))?)
+    };
+    let (tx, rx) = tokio::sync::mpsc::channel::<CopyInChunk>(16);
+    // The server takes environment_id and dest_path from the first chunk only.
+    let mut first = Some(CopyInChunk {
+        environment_id: Some(id.into()),
+        dest_path: Some(WORK.into()),
+        ..Default::default()
+    });
+    let reader = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        let mut buf = vec![0u8; 256 * 1024];
+        loop {
+            let n = r.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            let mut chunk = first.take().unwrap_or_default();
+            chunk.data = buf[..n].to_vec();
+            if tx.blocking_send(chunk).is_err() {
+                return Ok(());
+            }
+        }
+        if let Some(chunk) = first {
+            let _ = tx.blocking_send(chunk);
+        }
+        Ok(())
+    });
+    let sent = c.copy_in(ReceiverStream::new(rx)).await;
+    reader
+        .await?
+        .with_context(|| format!("reading --input {src}"))?;
+    sent.context("copying --input into the VM")?;
+    Ok(())
+}
+
 async fn run_in(
     c: &mut BackendPluginClient<tonic::transport::Channel>,
     id: &str,
     command: Vec<String>,
+    input: Option<String>,
     quiet: bool,
     t0: Instant,
 ) -> Result<i32> {
@@ -281,12 +337,19 @@ async fn run_in(
         }
     }
     let ready = t0.elapsed();
+    let workdir = match input {
+        Some(src) => {
+            copy_in(c, id, src).await?;
+            WORK
+        }
+        None => "/root",
+    };
     let mut exec = c
         .exec(ExecRequest {
             environment_id: id.into(),
             command,
             env,
-            workdir: "/root".into(),
+            workdir: workdir.into(),
             ..Default::default()
         })
         .await?
